@@ -174,7 +174,8 @@ impl Trustmark {
     /// Decode a watermark from an image.
     ///
     /// This tries the version named by the watermark's schema bits first and then every other
-    /// version, and returns the payload of the first one that passes the BCH check. Use
+    /// version, and returns the payload of the first one that passes the BCH check without a
+    /// correction in the zero padding of the payload. Use
     /// [`decode_with`](Self::decode_with) to restrict the accepted versions or to see how the
     /// watermark was decoded. Passing the BCH check is not proof of provenance; see
     /// [`DecodeOptions`].

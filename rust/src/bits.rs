@@ -137,7 +137,7 @@ impl Bits {
     fn new(s: String) -> Result<Self, Error> {
         let schema_version = Bits::schema_version(&s)?;
         evaluation_order(schema_version)
-            .find_map(|version| Bits::new_with_version(&s, version, false).ok())
+            .find_map(|version| Bits::new_with_version(&s, version, true).ok())
             .map(|(bits, _)| bits)
             .ok_or(Error::CorruptWatermark)
     }
@@ -289,9 +289,9 @@ pub(super) fn bitstring(array: ArrayD<f32>) -> Result<String, Error> {
 ///
 /// Passing the BCH check only means that the bits are within the version's correction capacity of
 /// some valid codeword. It is not authentication and not proof of provenance. Of 100,000 uniformly
-/// random 100-bit strings, 10.1% pass the default options (8.5% as [`Version::Bch3`]), 0.57% pass
-/// [`strict`](Self::strict) options, and 0.21% pass when only [`Version::Bch5`] is allowed. About
-/// 9% of genuine [`Version::BchSuper`], [`Version::Bch5`] and [`Version::Bch4`] watermarks also
+/// random 100-bit strings, 8.7% pass the default options (7.4% as [`Version::Bch3`]), 0.57% pass
+/// [`strict`](Self::strict) options, and 0.18% pass when only [`Version::Bch5`] is allowed. About
+/// 8% of genuine [`Version::BchSuper`], [`Version::Bch5`] and [`Version::Bch4`] watermarks also
 /// pass the BCH check as [`Version::Bch3`], so one whose schema bits were damaged can decode to a
 /// payload that was never embedded; see [`Decoded::is_ambiguous`].
 ///
@@ -311,13 +311,13 @@ impl Default for DecodeOptions {
         Self {
             allowed: 0b1111,
             fallback: true,
-            padding_check: false,
+            padding_check: true,
         }
     }
 }
 
 impl DecodeOptions {
-    /// Allow every version, fall back from the schema bits and accept corrections in the padding,
+    /// Allow every version, fall back from the schema bits and reject corrections in the padding,
     /// like [`Trustmark::decode`](crate::Trustmark::decode).
     pub fn new() -> Self {
         Self::default()
@@ -325,8 +325,9 @@ impl DecodeOptions {
 
     /// Accept only the version named by the schema bits, and reject corrections in the padding.
     ///
-    /// This is `DecodeOptions::new().with_fallback(false).with_padding_check(true)`. It rejects
-    /// watermarks whose schema bits were damaged instead of guessing their version.
+    /// This is `DecodeOptions::new().with_fallback(false).with_padding_check(true)` (the padding
+    /// check is on by default). It rejects watermarks whose schema bits were damaged instead of
+    /// guessing their version.
     pub fn strict() -> Self {
         Self::new().with_fallback(false).with_padding_check(true)
     }
@@ -357,15 +358,15 @@ impl DecodeOptions {
     }
 
     /// Whether to reject bits that only pass the BCH check by correcting one of the zero bits
-    /// that pad the payload to a whole byte (default `false`).
+    /// that pad the payload to a whole byte (default `true`).
     ///
     /// No encoder sets those bits, so bits that need such a correction are further than the
     /// version's correction capacity from every packet an encoder can produce, and a watermark with
-    /// no more bit flips than the capacity never needs one. The check lowers the share of random
-    /// 100-bit strings that pass the default options from 10.1% to 8.7%.
-    /// [`Trustmark::decode`](crate::Trustmark::decode) and the Python and JavaScript decoders
-    /// accept these corrections; the C++ decoder rejects them. A version that fails the check is
-    /// not listed in [`Decoded::candidates`].
+    /// no more bit flips than the capacity never needs one. Without the check, 10.1% of random
+    /// 100-bit strings pass the otherwise default options instead of 8.7%.
+    /// [`Trustmark::decode`](crate::Trustmark::decode) and the C++ decoder reject these
+    /// corrections; the Python and JavaScript decoders accept them, as `false` does. A version that
+    /// fails the check is not listed in [`Decoded::candidates`].
     #[must_use]
     pub fn with_padding_check(mut self, padding_check: bool) -> Self {
         self.padding_check = padding_check;
@@ -878,14 +879,14 @@ mod tests {
 
         assert_eq!(
             format!("{:?}", bch5.with_fallback(false)),
-            "DecodeOptions { allowed_versions: [Bch5], fallback: false, padding_check: false }"
+            "DecodeOptions { allowed_versions: [Bch5], fallback: false, padding_check: true }"
         );
         assert_eq!(DecodeOptions::new(), DecodeOptions::default());
     }
 
     /// A clean BCH_5 packet from the Python reference encoder that also passes the BCH_3 check,
     /// with a different payload: `(BCH_5 payload, packet, BCH_3 payload)`. Found by decoding 2000
-    /// random BCH_5 packets from the reference encoder under every version; about 9% of BCH_5
+    /// random BCH_5 packets from the reference encoder under every version; about 8% of BCH_5
     /// packets are ambiguous like this, almost all of them with BCH_3.
     const AMBIGUOUS: (&str, &str, &str) = (
         "1100011101011110010100100100010010111100000001111000001111001",
@@ -963,19 +964,21 @@ mod tests {
     #[test]
     fn padding_check() {
         for (version, bits, payload) in PADDING_CORRECTIONS {
-            let decoded = decode(bits, DecodeOptions::default()).unwrap();
+            let lenient = DecodeOptions::new().with_padding_check(false);
+            let decoded = decode(bits, lenient).unwrap();
             assert_eq!(decoded.version, *version);
             assert_eq!(decoded.payload, *payload);
             assert_eq!(decoded.corrected_bits, 1);
-            for options in [
-                DecodeOptions::new().with_padding_check(true),
-                DecodeOptions::strict(),
-            ] {
+            for options in [DecodeOptions::default(), DecodeOptions::strict()] {
                 assert!(matches!(
                     decode(bits, options),
                     Err(Error::CorruptWatermark)
                 ));
             }
+            assert!(matches!(
+                Bits::new(bits.to_string()),
+                Err(Error::CorruptWatermark)
+            ));
         }
 
         // A watermark with no more bit flips than the capacity never needs a padding correction.
