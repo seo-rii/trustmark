@@ -74,7 +74,8 @@ torchvision releases and raises `NotImplementedError`.
 ## Model loading — what gets downloaded and when
 
 On first use, model weights are fetched from Adobe's CDN and cached locally inside the
-package directory. Three separate models exist; not all are needed for every use case:
+package directory, or in the directory passed as `model_dir`. Three separate models
+exist; not all are needed for every use case:
 
 | Model | Constructor arg | Needed for | Approx size |
 |---|---|---|---|
@@ -85,8 +86,9 @@ package directory. Three separate models exist; not all are needed for every use
 ### Downloading models manually
 
 If automatic download fails (no network access at runtime, corporate proxy, air-gapped
-deployment), fetch the files yourself and place them in the package's `models/`
-directory — for an editable install from this repo, that's `python/trustmark/models/`.
+deployment), fetch the files yourself and place them either in a directory of your
+choice that you pass as `model_dir`, or in the package's `models/` directory (the
+default) — for an editable install from this repo, that's `python/trustmark/models/`.
 
 Each `model_type` (`C`, `Q`, `B`, or `P`) needs a subset of these files, named
 `{name}_{TYPE}.{ext}`:
@@ -114,6 +116,18 @@ checksum too: it is written to a temporary file in the same directory and only m
 into place once it matches, so an interrupted or corrupt download never replaces the
 model file and is reported as an error instead. A manually placed file must match that
 checksum exactly — no partial downloads or re-hosted mirrors with different content.
+
+To load pre-fetched files from your own directory and never touch the network, pass
+`model_dir` together with `allow_download=False`:
+
+```python
+tm = TrustMark(model_type='Q', loadRemover=False,
+               model_dir='/opt/trustmark-models', allow_download=False)
+```
+
+With `allow_download=False`, a missing file or one that fails the checksum is reported
+as an error naming the file and directory instead of being downloaded. With the default
+`allow_download=True`, `model_dir` is created if needed when a file has to be downloaded.
 
 **Skip the remover download** if you only need to embed or verify watermarks:
 

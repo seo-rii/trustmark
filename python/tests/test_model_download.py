@@ -56,7 +56,9 @@ def network(monkeypatch):
 
 def tm():
     # check_and_download does not depend on loaded models; skip __init__
-    return TrustMark.__new__(TrustMark)
+    tm = TrustMark.__new__(TrustMark)
+    tm.allow_download = True
+    return tm
 
 
 def test_valid_existing_file_is_not_downloaded(tmp_path, network):
