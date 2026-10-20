@@ -255,4 +255,28 @@ mod tests {
             }
         });
     }
+
+    #[test]
+    fn decode_large_image_with_fine_texture() {
+        // Detail finer than a model pixel must be averaged away when downscaling (like Python's
+        // antialiased bilinear resize), not aliased into the decoder input. Upscale a watermarked
+        // image and overlay a 1px checkerboard texture.
+        let tm = Trustmark::new("./models", Variant::Q, Version::Bch5).unwrap();
+        let input = image::open("../images/ghost.png").unwrap();
+        let watermark = "1011011110011000111111000000011111011111011100000110110110111".to_owned();
+        let encoded = tm.encode(watermark.clone(), input, 0.95).unwrap().to_rgb8();
+        let mut large =
+            image::imageops::resize(&encoded, 1000, 1000, image::imageops::FilterType::Triangle);
+        for (x, y, pixel) in large.enumerate_pixels_mut() {
+            for channel in &mut pixel.0 {
+                *channel = if (x + y) % 2 == 0 {
+                    channel.saturating_add(48)
+                } else {
+                    channel.saturating_sub(48)
+                };
+            }
+        }
+        let decoded = tm.decode(DynamicImage::ImageRgb8(large)).unwrap();
+        assert_eq!(watermark, decoded);
+    }
 }
