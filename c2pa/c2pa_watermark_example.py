@@ -22,6 +22,9 @@ def embed_watermark(img_in, img_out, watermarkID, tm):
    if (has_alpha):
       alpha=cover.split()[-1]
    encoded=tm.encode(rgb, watermarkID, MODE='binary')
+   out_format=Image.registered_extensions().get(os.path.splitext(img_out)[1].lower())
+   if (has_alpha and out_format!='JPEG'):  # JPEG cannot store an alpha channel
+      encoded.putalpha(alpha)
    params={
       "exif":cover.info.get('exif'),
       "icc_profile":cover.info.get('icc_profile'),
