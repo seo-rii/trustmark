@@ -344,10 +344,11 @@ pub(super) fn bch_encode(ecc_state: &mut EccState, data: &[u8]) -> Vec<u8> {
         let tmp = data[posn];
         let cyclic_tab = ecc_state.cyclic_tab.as_ref().unwrap();
         posn += 1;
-        let pidx = (l + 1) * (((ecc[0] >> 24) ^ (tmp as u32)) & 0xff);
+        let mut pidx = (l + 1) * (((ecc[0] >> 24) ^ (tmp as u32)) & 0xff);
         for i in 0..l {
             ecc[i as usize] = ((ecc[i as usize] << 8) | (ecc[(i + 1) as usize] >> 24))
                 ^ cyclic_tab[pidx as usize];
+            pidx += 1;
         }
         ecc[l as usize] = (ecc[l as usize] << 8) ^ cyclic_tab[pidx as usize];
         leftdata -= 1;
@@ -983,5 +984,29 @@ mod tests {
         let mut ecc_state = bch_init(4, 137);
         let ecc = bch_encode(&mut ecc_state, &[133, 20, 228, 249, 11, 172, 165, 151, 0]);
         assert_eq!(ecc, &[115, 32, 10, 0]);
+    }
+
+    #[test]
+    fn encode_trailing_bytes() {
+        // Data that is not a whole number of 32-bit words is partly encoded byte by byte. Expected
+        // values are from the Python reference implementation (`python/trustmark/bchecc.py`).
+        let mut ecc_state = bch_init(8, 137);
+        let ecc = bch_encode(&mut ecc_state, &[162, 24, 132, 50, 33]);
+        assert_eq!(ecc, &[246, 83, 54, 138, 104, 72, 152]);
+        let ecc = bch_encode(&mut ecc_state, &[162, 24, 132, 50, 33, 0]);
+        assert_eq!(ecc, &[36, 133, 140, 81, 26, 31, 133]);
+
+        let mut ecc_state = bch_init(5, 137);
+        let ecc = bch_encode(&mut ecc_state, &[133, 20, 228, 249, 11]);
+        assert_eq!(ecc, &[47, 138, 60, 71, 32]);
+    }
+
+    #[test]
+    fn decode_trailing_bytes() {
+        let mut ecc_state = bch_init(8, 137);
+        let mut data = [162 ^ 0x10, 24, 132, 50, 33 ^ 0x01];
+        let bitflips = bch_decode(&mut ecc_state, &mut data, &[246, 83, 54, 138, 104, 72, 152]);
+        assert_eq!(bitflips, 2);
+        assert_eq!(data, [162, 24, 132, 50, 33]);
     }
 }
