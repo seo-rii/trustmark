@@ -171,11 +171,14 @@ tm.encode(
     cover_image,          # 8-bit PIL image (see "Image modes"), any resolution
     string_secret,        # bit string (MODE='binary') or 7-bit ASCII string (MODE='text')
     MODE='binary',
-    WM_STRENGTH=1.0,      # increase for stronger watermark, at cost of visual quality
+    WM_STRENGTH=1.0,      # finite and >= 0; increase for stronger watermark, at cost of visual quality
     WM_MERGE='bilinear',  # interpolation mode when upscaling residual back to original res
 )
 # returns: PIL image (RGB, or RGBA when the input has transparency), same resolution as input
 ```
+
+`concentrate_wm_region` (constructor) must be a finite number in `(0, 1]`, and
+`WM_STRENGTH` a finite number `>= 0`; other values raise `ValueError`.
 
 ## Image modes
 

@@ -5,6 +5,7 @@ round trips at the end, which only run when the Q model files are already presen
 """
 
 import io
+import math
 import pathlib
 
 import numpy as np
@@ -210,6 +211,39 @@ def test_region_emptied_by_concentration_is_rejected(method):
     with pytest.raises(ValueError, match='too small for concentrate_wm_region=0.1'):
         call(tm, method, Image.new('RGB', (9, 9)))
     call(tm, method, Image.new('RGB', (10, 10)))
+
+
+@pytest.mark.parametrize('strength', [math.nan, math.inf, -math.inf, -0.5, '1.0', None, 1j])
+@pytest.mark.parametrize('method', ['encode', 'remove_watermark'])
+def test_invalid_strength_is_rejected(strength, method):
+    tm = stub_trustmark()
+    with pytest.raises(ValueError, match='WM_STRENGTH must be a finite number >= 0'):
+        call(tm, method, Image.new('RGB', (8, 8)), WM_STRENGTH=strength)
+
+
+@pytest.mark.parametrize('strength', [0, 0.0, 1, 1.5, np.float32(0.8), np.float64(2.0)])
+@pytest.mark.parametrize('method', ['encode', 'remove_watermark'])
+def test_valid_strength_is_accepted(strength, method):
+    tm = stub_trustmark()
+    assert call(tm, method, Image.new('RGB', (8, 8)), WM_STRENGTH=strength).size == (8, 8)
+
+
+def construct(monkeypatch, **kwargs):
+    def load_model(self, *args, **kw):
+        return object()
+    monkeypatch.setattr(TrustMark, 'load_model', load_model)
+    return TrustMark(verbose=False, device='cpu', model_type='Q', loadRemover=False, **kwargs)
+
+
+@pytest.mark.parametrize('value', [0, 0.0, -0.2, 1.0001, 2, math.nan, math.inf, '0.5', None])
+def test_invalid_concentrate_wm_region_is_rejected(monkeypatch, value):
+    with pytest.raises(ValueError, match=r'concentrate_wm_region must be a finite number in \(0, 1\]'):
+        construct(monkeypatch, concentrate_wm_region=value)
+
+
+@pytest.mark.parametrize('value', [1, 1.0, 0.5, 0.01, np.float32(0.8)])
+def test_valid_concentrate_wm_region_is_accepted(monkeypatch, value):
+    assert construct(monkeypatch, concentrate_wm_region=value).concentrate_wm_region == value
 
 
 # round trips with the real Q weights, only when they are already present (no download)

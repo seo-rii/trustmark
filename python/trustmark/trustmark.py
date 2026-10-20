@@ -12,6 +12,8 @@ import os
 import pathlib
 import time
 import importlib
+import math
+import numbers
 
 from omegaconf import OmegaConf
 from .datalayer import DataLayer
@@ -111,6 +113,8 @@ class TrustMark():
         self.ecc = DataLayer(secret_len, verbose=verbose, encoding_mode=encoding_type)
         self.enctyp = encoding_type
         self.aspect_ratio_lim=ASPECT_RATIO_LIM
+        if not _is_finite_number(concentrate_wm_region) or not 0 < concentrate_wm_region <= 1:
+            raise ValueError('concentrate_wm_region must be a finite number in (0, 1], got %r' % (concentrate_wm_region,))
         self.concentrate_wm_region=concentrate_wm_region
 
         if model_type=='P':
@@ -475,6 +479,8 @@ class TrustMark():
         #   input has transparency (RGBA, LA, P with transparency), else RGB
 
         rgb_cover_image, alpha = split_alpha(in_cover_image)
+        if not _is_finite_number(WM_STRENGTH) or WM_STRENGTH < 0:
+            raise ValueError('WM_STRENGTH must be a finite number >= 0, got %r' % (WM_STRENGTH,))
 
         # secrets
         if not self.use_ECC:
@@ -527,6 +533,8 @@ class TrustMark():
                                       "Initialize TrustMark passing the constructor loadRemover=True before calling remove_watermark().")
 
         rgb_cover_image, alpha = split_alpha(in_cover_image)
+        if not _is_finite_number(WM_STRENGTH) or WM_STRENGTH < 0:
+            raise ValueError('WM_STRENGTH must be a finite number >= 0, got %r' % (WM_STRENGTH,))
 
         stego = self.get_the_image_for_processing(rgb_cover_image)
         W, H = stego.size
@@ -566,3 +574,5 @@ def instantiate_from_config(config):
   
 
 
+def _is_finite_number(value):
+    return isinstance(value, numbers.Real) and math.isfinite(value)
