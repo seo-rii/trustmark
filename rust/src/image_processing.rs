@@ -156,6 +156,14 @@ pub(super) fn apply_residual(input: DynamicImage, residual: DynamicImage) -> Dyn
     }
 }
 
+/// Return whether the model sees a center-cropped square instead of the whole image.
+///
+/// The P variant is always center-cropped. Other variants are center-cropped when one side of the
+/// image is more than twice as long as the other.
+pub(super) fn is_center_cropped(variant: Variant, (width, height): (u32, u32)) -> bool {
+    height > width * 2 || width > height * 2 || variant == Variant::P
+}
+
 /// Return the size and offset of the "center-cropped" image.
 ///
 /// Returns `(width, height, xpos, ypos)` for the square to crop.
@@ -165,7 +173,7 @@ pub(super) fn apply_residual(input: DynamicImage, residual: DynamicImage) -> Dyn
 fn center_crop_size_and_offset(variant: Variant, img: &DynamicImage) -> (u32, u32, u32, u32) {
     let (width, height) = img.dimensions();
 
-    if height > width * 2 || width > height * 2 || variant == Variant::P {
+    if is_center_cropped(variant, (width, height)) {
         let m = cmp::min(height, width);
         let offset = (cmp::max(height, width) - m) / 2;
 
@@ -322,6 +330,38 @@ mod tests {
             center_crop_size_and_offset(Variant::P, &image),
             (100, 100, 0, 5)
         );
+    }
+
+    #[test]
+    fn crop_boundary() {
+        for variant in [Variant::B, Variant::C, Variant::Q] {
+            // Exactly 2:1 is not center-cropped...
+            for (width, height) in [(1024, 512), (512, 1024)] {
+                let image = DynamicImage::new(width, height, image::ColorType::L8);
+                assert!(!is_center_cropped(variant, (width, height)));
+                assert_eq!(
+                    center_crop_size_and_offset(variant, &image),
+                    (width, height, 0, 0)
+                );
+            }
+
+            // ...but one pixel past 2:1 is.
+            let image = DynamicImage::new(1025, 512, image::ColorType::L8);
+            assert!(is_center_cropped(variant, (1025, 512)));
+            assert_eq!(
+                center_crop_size_and_offset(variant, &image),
+                (512, 512, 256, 0)
+            );
+            let image = DynamicImage::new(512, 1025, image::ColorType::L8);
+            assert!(is_center_cropped(variant, (512, 1025)));
+            assert_eq!(
+                center_crop_size_and_offset(variant, &image),
+                (512, 512, 0, 256)
+            );
+        }
+
+        assert!(is_center_cropped(Variant::P, (512, 512)));
+        assert!(is_center_cropped(Variant::P, (1024, 512)));
     }
 
     #[test]

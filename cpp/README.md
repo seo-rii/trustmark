@@ -77,5 +77,6 @@ python3 cpp/tests/interoperability.py cpp/build/trustmark-runner \
   rust/target/debug/trustmark rust/models
 ```
 
-The Rust implementation does not reliably decode its own B/C watermarks on
-very wide images, so those cases are not used as cross-implementation fixtures.
+B/C on images wider than 2:1 are not covered yet. The Rust crate up to 0.4.0
+stretched the B/C residual across such images, so it could not decode its own
+B/C watermarks there.
