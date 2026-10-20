@@ -168,14 +168,37 @@ tm.decode(
 
 ```python
 tm.encode(
-    cover_image,          # PIL image, any resolution
+    cover_image,          # 8-bit PIL image (see "Image modes"), any resolution
     string_secret,        # bit string (MODE='binary') or 7-bit ASCII string (MODE='text')
     MODE='binary',
     WM_STRENGTH=1.0,      # increase for stronger watermark, at cost of visual quality
     WM_MERGE='bilinear',  # interpolation mode when upscaling residual back to original res
 )
-# returns: PIL image (RGB), same resolution as input
+# returns: PIL image (RGB, or RGBA when the input has transparency), same resolution as input
 ```
+
+## Image modes
+
+`encode`, `decode` and `remove_watermark` accept 8-bit PIL images in these modes. The
+watermark is embedded in (and read from) the RGB colour content; transparency is kept
+byte-exact and never watermarked.
+
+| Input mode | Watermarked as | `encode` / `remove_watermark` return |
+|---|---|---|
+| `RGB` | as is | `RGB` |
+| `RGBA` | `convert('RGB')` (colour of every pixel, including transparent ones) | `RGBA`, same alpha band |
+| `LA` | `convert('RGB')` (gray replicated to RGB) | `RGBA`, same alpha band |
+| `L` | `convert('RGB')` | `RGB` (the watermark is a colour signal, so the result is not grayscale) |
+| `P` with transparency | `convert('RGBA')`, then as `RGBA` | `RGBA`, alpha of the palette transparency |
+| `P` | `convert('RGB')` | `RGB` |
+| `CMYK` | `convert('RGB')` (Pillow's conversion, not colour-managed) | `RGB` |
+
+Other modes raise `ValueError`, including 16-bit and floating-point images (`I;16`, `I`,
+`F`); reduce them to 8 bits per channel first. Inputs that are not PIL images (e.g. numpy
+arrays) raise `TypeError`. Colour-key transparency of `L`/`RGB` images (a `transparency`
+entry in `image.info`, e.g. a PNG `tRNS` chunk) is not carried over. Empty images raise
+`ValueError`. Very small images (below roughly 100 pixels on the short side) are
+watermarked without error but often cannot be decoded.
 
 ## Watermark removal
 
