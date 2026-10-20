@@ -22,7 +22,7 @@ import urllib.request
 
 
 # for model checking
-from hashlib import md5
+from hashlib import md5, sha256
 from mmap import mmap, ACCESS_READ
 
 # Content Autenticity Initiative (CAI) Content Delivery Network
@@ -65,6 +65,9 @@ MODEL_CHECKSUMS['trustmark_rm_P.yaml']="654cabd3ac8339397fbc611ca7464780"
 MODEL_CHECKSUMS['trustmark_rm_P.ckpt']="8b8f4715ea474327921ee9d0f46d2c3f"
 MODEL_CHECKSUMS['trustmark_bbox_P.yaml']="749b0d62106f8f6648e6f781c3143105"
 MODEL_CHECKSUMS['trustmark_bbox_P.ckpt']="65863e44eaccb58b147f119371723200"
+
+# All of the files above belong to this model family; see models/manifest.json in the repository
+MODEL_FAMILY='trustmark'
 
 CONCENTRATE_WM_REGION = 1.0
 ASPECT_RATIO_LIM = 2.0
@@ -111,6 +114,7 @@ class TrustMark():
         self.enctyp = encoding_type
         self.aspect_ratio_lim=ASPECT_RATIO_LIM
         self.concentrate_wm_region=concentrate_wm_region
+        self.model_files=dict()  # part -> (config path, weights path) of each loaded model, see model_info()
 
         if model_type=='P':
            self.model_resolution_enc = 256
@@ -195,8 +199,30 @@ class TrustMark():
         misses, ignores = model.load_state_dict(state_dict, strict=False)
         model = model.to(device)
         model.eval()
+        self.model_files[part]=(config_path, weight_path)
 
         return model
+
+    def model_info(self):
+        # Describes the loaded models: their model family and variant as listed in models/manifest.json
+        # in the repository, and the size, md5 and sha256 of each file they were loaded from (read from
+        # disk now). 'published' is True when the md5 matches the published file's checksum.
+        files=dict()
+        for part, paths in self.model_files.items():
+            for path in paths:
+                name=os.path.basename(path)
+                if name in files:
+                    files[name]['parts'].append(part)
+                    continue
+                digest_md5, digest_sha256 = md5(), sha256()
+                with open(path, 'rb') as file:
+                    for chunk in iter(lambda: file.read(1<<20), b''):
+                        digest_md5.update(chunk)
+                        digest_sha256.update(chunk)
+                files[name]={'path': path, 'parts': [part], 'size': os.path.getsize(path),
+                             'md5': digest_md5.hexdigest(), 'sha256': digest_sha256.hexdigest(),
+                             'published': MODEL_CHECKSUMS.get(name)==digest_md5.hexdigest()}
+        return {'model_family': MODEL_FAMILY, 'variant': self.model_type, 'files': files}
 
     def get_the_image_for_processing(self, in_image):
         scale=self.concentrate_wm_region
