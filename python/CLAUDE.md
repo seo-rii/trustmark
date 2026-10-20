@@ -109,8 +109,11 @@ curl -o python/trustmark/models/encoder_Q.ckpt   https://cai-watermark.adobe.net
 
 TrustMark verifies each file's MD5 against a hardcoded checksum (`MODEL_CHECKSUMS` in
 `trustmark/trustmark.py`) before using it; a mismatch is treated as a missing file and
-triggers an automatic re-download. A manually placed file must match that checksum
-exactly — no partial downloads or re-hosted mirrors with different content.
+triggers an automatic re-download. The downloaded file is verified against the same
+checksum too: it is written to a temporary file in the same directory and only moved
+into place once it matches, so an interrupted or corrupt download never replaces the
+model file and is reported as an error instead. A manually placed file must match that
+checksum exactly — no partial downloads or re-hosted mirrors with different content.
 
 **Skip the remover download** if you only need to embed or verify watermarks:
 
