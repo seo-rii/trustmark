@@ -95,6 +95,8 @@ class TrustMark():
         # the location of three models
         assert model_type in ['C', 'Q', 'B', 'P']
         self.model_type = model_type
+        if loadBBoxDetector and model_type not in ['Q', 'P']:
+            raise ValueError(f'BBox detector model is only published for model_type Q and P, not {model_type}')
 
 
         locations={'config' : os.path.join(pathlib.Path(__file__).parent.resolve(),f'models/trustmark_{self.model_type}.yaml'), 
@@ -418,11 +420,11 @@ class TrustMark():
             elif angle == 270:
                 rotated_cover = in_stego_image.transpose(Image.ROTATE_270) #rgbcover.rotate(angle)
 
-            if DETECTFIRST and self.detector is not None:
-               # run localization to get most likely box(es)
+            if DETECTFIRST:
+               # run localization to get most likely box(es), raises if the detector is not loaded
                boxes_pred = self.localize(rotated_cover, return_all=True)
                if boxes_pred is None:
-                    return '', False, -1
+                    continue # no boxes in this orientation, try the next one
                for bbox in boxes_pred:
                     # bbox is normalized [x1, y1, x2, y2]
                     w, h = rotated_cover.size
