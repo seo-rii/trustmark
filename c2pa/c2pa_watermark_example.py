@@ -1,4 +1,6 @@
 import random,os
+import subprocess
+import sys
 from PIL import Image
 import json
 import struct
@@ -114,7 +116,12 @@ def main() :
    fp=open('manifest.json','wt')
    fp.write(json.dumps(mf, indent=4))
    fp.close()
-   os.system('c2patool '+img_out+' -m manifest.json -f -o '+img_out_signed)
+   try:
+      subprocess.run(['c2patool', img_out, '-m', 'manifest.json', '-f', '-o', img_out_signed], check=True)
+   except FileNotFoundError:
+      sys.exit('c2patool was not found; install it and make sure it is on your PATH')
+   except subprocess.CalledProcessError as e:
+      sys.exit('c2patool failed with exit code %d; %s was not signed' % (e.returncode, img_out_signed))
          
 
 
@@ -130,8 +137,10 @@ def main() :
          print('Watermark does not match!')
          print('expected schema %d: %s' % (tm.enctyp, id))
          print('decoded schema %d: %s' % (wm_schema, wm_id))
+         sys.exit(1)
    else:
        print('No watermark detected!')   
+       sys.exit(1)
 
 
 
