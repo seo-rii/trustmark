@@ -104,6 +104,24 @@ im_recover = tm.remove_watermark(stego)
 im_recover.save('images/recovered.png')
 ```
 
+### Loading only the models you need
+
+By default `TrustMark` loads the encoder, the decoder and the watermark remover. Pass `loadEncoder=False`, `loadDecoder=False` or `loadRemover=False` to skip networks you do not call; for example, a service that only checks images for watermarks needs just the decoder. Calling a method whose model was not loaded raises `trustmark.ModelNotLoadedError`.
+
+Construct the instance once and reuse it for every request rather than creating one per image, because construction verifies and loads the model files:
+
+```python
+from trustmark import TrustMark
+
+# once, at start-up
+verifier = TrustMark(model_type='Q', loadEncoder=False, loadRemover=False)
+
+# per request
+def check(image):
+    wm_secret, wm_present, wm_schema = verifier.decode(image.convert('RGB'))
+    return wm_secret if wm_present else None
+```
+
 ## Data schema
 
 TrustMark encodes a payload (the watermark data embedded within the image) of 100 bits.
