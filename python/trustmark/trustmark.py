@@ -478,6 +478,8 @@ class TrustMark():
                 secret = ''.join(format(x, '08b') for x in secret)
                 secret = [int(x) for x in secret]
                 secret = np.array(secret, dtype=np.float32)
+            if len(secret) != self.secret_len:
+                raise ValueError('without ECC the payload must be exactly %d bits, got %d bits' % (self.secret_len, len(secret)))
         else:
             if MODE=="binary":
                 secret = self.ecc.encode_binary([string_secret])

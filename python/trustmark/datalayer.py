@@ -108,9 +108,18 @@ class DataLayer(object):
         return np.array([self._encode_binary(t) for t in text])
 
     def _encode_binary(self, strbin):
-        return self.process_encode(str(strbin))
+        strbin = str(strbin)
+        capacity = self.schemaCapacity(self.encoding_mode)
+        if any(c not in '01' for c in strbin):
+            raise ValueError("binary payload must contain only '0' and '1' characters")
+        if len(strbin) > capacity:
+            raise ValueError('binary payload has %d bits but %s allows at most %d bits' % (len(strbin), self.schemaInfo(self.encoding_mode), capacity))
+        return self.process_encode(strbin)
 
     def _encode_text(self, text: str):
+        max_chars = self.schemaCapacity(self.encoding_mode) // 7  # 7 bits per character
+        if len(text) > max_chars:
+            raise ValueError('text payload has %d characters but %s allows at most %d characters' % (len(text), self.schemaInfo(self.encoding_mode), max_chars))
         data = self.encode_text_ascii(text)  # bytearray
         packet_d = ''.join(format(x, '08b') for x in data)
         return self.process_encode(packet_d)
@@ -213,7 +222,9 @@ class DataLayer(object):
         # encode text to 7-bit ascii
         # input: text, str
         # output: encoded text, bytearray
-        text_int7 = [ord(t) & 127 for t in text]
+        if not text.isascii():
+            raise ValueError('text payload must contain only 7-bit ASCII characters')
+        text_int7 = [ord(t) for t in text]
         text_bitstr = ''.join(format(t,'07b') for t in text_int7)
         if len(text_bitstr) % 8 != 0:
             text_bitstr =  text_bitstr + '0'*(8-len(text_bitstr)%8) # + text_bitstr  # pad to multiple of 8
