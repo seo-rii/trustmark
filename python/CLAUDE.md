@@ -74,13 +74,19 @@ torchvision releases and raises `NotImplementedError`.
 ## Model loading — what gets downloaded and when
 
 On first use, model weights are fetched from Adobe's CDN and cached locally inside the
-package directory. Three separate models exist; not all are needed for every use case:
+package directory. Four separate models exist; not all are needed for every use case:
 
 | Model | Constructor arg | Needed for | Approx size |
 |---|---|---|---|
-| Encoder + Decoder | always loaded | `encode`, `decode` | moderate |
+| Encoder | `loadEncoder=True` (default) | `encode` | moderate |
+| Decoder | `loadDecoder=True` (default) | `decode` (also with `DETECTFIRST=True`) | moderate |
 | Remover | `loadRemover=True` (default) | `remove_watermark` | large |
-| BBox detector | `loadBBoxDetector=False` (default) | `decode(..., DETECTFIRST=True)` | large |
+| BBox detector | `loadBBoxDetector=False` (default) | `localize`, `decode(..., DETECTFIRST=True)` | large |
+
+Only the models you construct with are loaded into memory. Calling `encode` on an
+instance built with `loadEncoder=False`, or `decode` on one built with `loadDecoder=False`,
+raises `ModelNotLoadedError`. The bbox detector only finds watermarked regions; the regions
+are still read by the decoder, so `DETECTFIRST=True` needs both the detector and the decoder.
 
 If the encoder or decoder files cannot be fetched, the constructor raises
 `ModelNotLoadedError` (`from trustmark import ModelNotLoadedError`, a `RuntimeError`
@@ -99,9 +105,9 @@ Each `model_type` (`C`, `Q`, `B`, or `P`) needs a subset of these files, named
 
 | File pattern | Purpose | Needed for |
 |---|---|---|
-| `trustmark_{TYPE}.yaml` | encoder/decoder config | always |
-| `decoder_{TYPE}.ckpt` | decoder weights | always |
-| `encoder_{TYPE}.ckpt` | encoder weights | always |
+| `trustmark_{TYPE}.yaml` | encoder/decoder config | `loadEncoder=True` or `loadDecoder=True` (defaults) |
+| `decoder_{TYPE}.ckpt` | decoder weights | `loadDecoder=True` (default) |
+| `encoder_{TYPE}.ckpt` | encoder weights | `loadEncoder=True` (default) |
 | `trustmark_rm_{TYPE}.yaml`, `trustmark_rm_{TYPE}.ckpt` | remover config/weights | `loadRemover=True` (default) |
 | `trustmark_bbox_{TYPE}.yaml`, `trustmark_bbox_{TYPE}.ckpt` | bbox detector config/weights | `loadBBoxDetector=True`; **only published for `Q` and `P`** |
 
@@ -131,6 +137,30 @@ decoding (e.g. a cropped or composited image):
 tm = TrustMark(model_type='Q', loadRemover=False, loadBBoxDetector=True)
 wm_secret, wm_present, wm_schema = tm.decode(img, MODE='binary', DETECTFIRST=True)
 ```
+
+**Load one network** for a service that only embeds or only verifies watermarks:
+
+```python
+embedder = TrustMark(model_type='Q', loadRemover=False, loadDecoder=False)  # encode only
+verifier = TrustMark(model_type='Q', loadRemover=False, loadEncoder=False)  # decode only
+```
+
+### Long-lived services
+
+Construct `TrustMark` once (e.g. at process start-up) and reuse the instance for every
+request. The constructor verifies the model files' MD5 checksums and builds the networks,
+which takes seconds and hundreds of MB; `encode` and `decode` do not modify the instance.
+
+```python
+from trustmark import TrustMark
+
+VERIFIER = TrustMark(model_type='Q', loadRemover=False, loadEncoder=False)  # once per process
+
+def verify(image):  # called per request
+    return VERIFIER.decode(image.convert('RGB'), MODE='binary')
+```
+
+Do not create a new `TrustMark` inside the request handler.
 
 ## Model variants
 

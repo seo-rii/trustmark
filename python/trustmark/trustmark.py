@@ -82,7 +82,7 @@ class TrustMark():
        BCH_4=2
        BCH_5=1
 
-    def __init__(self, use_ECC=True, verbose=True, secret_len=100, device='', model_type='Q', encoding_type=Encoding.BCH_5, concentrate_wm_region=CONCENTRATE_WM_REGION, loadRemover=True, loadBBoxDetector=False):
+    def __init__(self, use_ECC=True, verbose=True, secret_len=100, device='', model_type='Q', encoding_type=Encoding.BCH_5, concentrate_wm_region=CONCENTRATE_WM_REGION, loadRemover=True, loadBBoxDetector=False, loadEncoder=True, loadDecoder=True):
         # Initializes the TrustMark watermark encoder/decoder/remover/detector module
 
         super(TrustMark, self).__init__()
@@ -125,8 +125,13 @@ class TrustMark():
         self.model_resolution_remove = 256
         self.model_resolution_max_detect = 1600
         
-        self.decoder = self.load_model(locations['config'], locations['decoder'], self.device, secret_len, part='decoder')
-        self.encoder = self.load_model(locations['config'], locations['encoder'], self.device, secret_len, part='encoder')
+        # load only the networks the caller will use: encode() needs the encoder, decode() the decoder
+        self.decoder = None
+        self.encoder = None
+        if loadDecoder:
+          self.decoder = self.load_model(locations['config'], locations['decoder'], self.device, secret_len, part='decoder')
+        if loadEncoder:
+          self.encoder = self.load_model(locations['config'], locations['encoder'], self.device, secret_len, part='encoder')
         self.removal = None
         self.detector = None
         if loadRemover:
@@ -411,6 +416,10 @@ class TrustMark():
         # stego_image: PIL image
         # Outputs: secret numpy array (1, secret_len)
 
+        if self.decoder is None:
+            raise ModelNotLoadedError("Decoder model is not loaded. "
+                                      "Initialize TrustMark passing the constructor loadDecoder=True before calling decode().")
+
         if ROTATION:
            angleset = [0, 90, 180, 270]
         else:
@@ -491,6 +500,9 @@ class TrustMark():
                 secret = self.ecc.encode_binary([string_secret])
             else:
                 secret = self.ecc.encode_text([string_secret])
+        if self.encoder is None:
+            raise ModelNotLoadedError("Encoder model is not loaded. "
+                                      "Initialize TrustMark passing the constructor loadEncoder=True before calling encode().")
         if self.model_type == 'P':
             WM_STRENGTH = WM_STRENGTH * 1.25
         secret = torch.from_numpy(secret).float().to(self.device)
