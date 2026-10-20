@@ -34,7 +34,23 @@ const VECTORS = [
   { schema: 3, payload: "110001000001101101100011101011110100110111001100101011000100000110100010101", packet: "1100010000011011011000111010111101001101110011001010110001000001101000101010010000110100110110100011" },
 ];
 
+// Edge cases from the Python data layer: all-ones payloads, and short payloads that are
+// padded with zeros up to the schema capacity
+const EDGE_VECTORS = [
+  { schema: 0, payload: "1111111111111111111111111111111111111111", packet: "1111111111111111111111111111111111111111110101111101100001100000101111101111000111001101010010010000" },
+  { schema: 0, payload: "1", packet: "1000000000000000000000000000000000000000111101101110010000010111110011001101111101111100000110000000" },
+  { schema: 0, payload: "10101010101010101010", packet: "1010101010101010101000000000000000000000100001010111011101101010001001101000010001110000101101010000" },
+  { schema: 1, payload: "1111111111111111111111111111111111111111111111111111111111111", packet: "1111111111111111111111111111111111111111111111111111111111111111101010101001101001110000100100100001" },
+  { schema: 1, payload: "1", packet: "1000000000000000000000000000000000000000000000000000000000000011000010111111011110110110111111100001" },
+  { schema: 1, payload: "101010101010101010101010101010", packet: "1010101010101010101010101010100000000000000000000000000000000010110100111110101000010001001111110001" },
+  { schema: 2, payload: "11111111111111111111111111111111111111111111111111111111111111111111", packet: "1111111111111111111111111111111111111111111111111111111111111111111111011001100000100011011100000010" },
+  { schema: 2, payload: "1", packet: "1000000000000000000000000000000000000000000000000000000000000000000000010101100110111011010111010010" },
+  { schema: 3, payload: "111111111111111111111111111111111111111111111111111111111111111111111111111", packet: "1111111111111111111111111111111111111111111111111111111111111111111111111111011011000111110001110011" },
+  { schema: 3, payload: "101010101010101010101010101010101010", packet: "1010101010101010101010101010101010100000000000000000000000000000000000000001101100010110110110100011" },
+];
+
 const SCHEMA_NAMES = ['BCH_SUPER', 'BCH_5', 'BCH_4', 'BCH_3'];
+const SCHEMA_CAPACITY = [40, 61, 68, 75];
 
 function toBools(bits) {
   return bits.split('').map((c) => c === '1');
@@ -107,4 +123,37 @@ test('reports no soft binding when no schema recovers the data', () => {
   assert.equal(dataobj.valid, false);
   assert.equal(dataobj.schema, 'BCH_5');
   assert.equal(dataobj.softBindingInfo, null);
+});
+
+test('builds the same packets as the Python data layer', () => {
+  const dl = loadDataLayer();
+  for (const vector of [...VECTORS, ...EDGE_VECTORS]) {
+    const packet = dl.DataLayer_Encode(vector.payload, vector.schema, dl.eccengine);
+    assert.equal(packet.join(''), vector.packet, `schema ${vector.schema}, payload ${vector.payload}`);
+  }
+});
+
+test('encoded packets decode to the zero-padded payload', () => {
+  const dl = loadDataLayer();
+  for (const vector of EDGE_VECTORS) {
+    const packet = dl.DataLayer_Encode(vector.payload, vector.schema, dl.eccengine);
+    const dataobj = dl.DataLayer_Decode(packet.map((bit) => bit === 1), dl.eccengine, 'Q');
+
+    assert.equal(dataobj.valid, true);
+    assert.equal(dataobj.schema, SCHEMA_NAMES[vector.schema]);
+    assert.equal(dataobj.data_binary, vector.payload.padEnd(SCHEMA_CAPACITY[vector.schema], '0'));
+  }
+});
+
+test('rejects payloads that do not fit the schema', () => {
+  const dl = loadDataLayer();
+  const encode = (payload, version = 1) => () => dl.DataLayer_Encode(payload, version, dl.eccengine);
+
+  assert.throws(encode('1'.repeat(62)), /62 bits but BCH_5 allows at most 61 bits/);
+  assert.throws(encode('1'.repeat(41), 0), /41 bits but BCH_SUPER allows at most 40 bits/);
+  assert.throws(encode('0102'), /'0' and '1' characters/);
+  // A payload given as a number would silently lose bits beyond 2^53
+  assert.throws(encode(1234567890123), /'0' and '1' characters/);
+  assert.throws(encode('101', 4), /Invalid schema version 4/);
+  assert.equal(dl.DataLayer_Encode('1'.repeat(61), 1, dl.eccengine).length, 100);
 });
