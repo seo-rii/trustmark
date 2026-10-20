@@ -12,6 +12,7 @@ import os
 import pathlib
 import time
 import importlib
+import uuid
 
 from omegaconf import OmegaConf
 from .datalayer import DataLayer
@@ -27,6 +28,9 @@ from mmap import mmap, ACCESS_READ
 
 # Content Autenticity Initiative (CAI) Content Delivery Network
 MODEL_REMOTE_HOST = "https://cai-watermark.adobe.net/watermarking/trustmark-models/"
+
+# Network timeout in seconds for model downloads; applies to connecting and to each read, not the whole transfer
+MODEL_DOWNLOAD_TIMEOUT = 60
 
 MODEL_CHECKSUMS=dict()
 
@@ -139,16 +143,45 @@ class TrustMark():
             return self.secret_len
 
     def check_and_download(self, filename):
+        name=os.path.basename(filename)
+        if name not in MODEL_CHECKSUMS:
+            raise ValueError(f'Unknown model file {name} (no entry in MODEL_CHECKSUMS), not downloading {filename}')
+        expected=MODEL_CHECKSUMS[name]
+
         valid=False
         if os.path.isfile(filename) and os.path.getsize(filename)>0:
             with open(filename) as file, mmap(file.fileno(), 0, access=ACCESS_READ) as file:
-                 valid= (MODEL_CHECKSUMS[pathlib.Path(filename).name]==md5(file).hexdigest())
+                 valid= (expected==md5(file).hexdigest())
 
         if not valid:
             print('Fetching model file (once only): '+filename)
-            urld=MODEL_REMOTE_HOST+os.path.basename(filename)
- 
-            urllib.request.urlretrieve(urld, filename=filename)
+            urld=MODEL_REMOTE_HOST+name
+
+            # Download to a uniquely named temporary file next to the target and verify it before
+            # atomically moving it into place, so an interrupted or corrupt download never appears
+            # under the final name and concurrent downloads of the same file cannot interleave
+            tmpname=os.path.join(os.path.dirname(filename), f'.{name}.{uuid.uuid4().hex}.part')
+            try:
+                digest=md5()
+                try:
+                    fd=os.open(tmpname, os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os, 'O_BINARY', 0), 0o666)
+                    with os.fdopen(fd, 'wb') as out, urllib.request.urlopen(urld, timeout=MODEL_DOWNLOAD_TIMEOUT) as response:
+                        for chunk in iter(lambda: response.read(1<<20), b''):
+                            digest.update(chunk)
+                            out.write(chunk)
+                except Exception as e:
+                    raise OSError(f'Failed to download model file {urld} to {filename}: {e}') from e
+
+                actual=digest.hexdigest()
+                if actual!=expected:
+                    raise OSError(f'Checksum mismatch for downloaded model file {urld}: expected md5 {expected}, got {actual}; download discarded, {filename} not updated')
+                os.replace(tmpname, filename)
+            finally:
+                # no-op after a successful replace
+                try:
+                    os.remove(tmpname)
+                except OSError:
+                    pass
 
     def load_model(self, config_path, weight_path, device, secret_len, part='all'):
         assert part in ['all', 'encoder', 'decoder', 'remover', 'detector']
