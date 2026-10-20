@@ -75,6 +75,19 @@ let output = tm.encode("0010101".to_owned(), input, 0.95);
 
 `encode` and `decode` take `&self`, so a loaded model can be shared between callers. Inference on the same encoder or decoder session is serialized; encoding and decoding use separate sessions and can run concurrently.
 
+### Load only the encoder or the decoder
+
+`Trustmark::new` loads both models. A service that only embeds or only reads watermarks can load just the one it uses, which needs only that model file and starts faster with less memory:
+
+```rust
+use trustmark::{SessionOptions, Trustmark, Variant, Version};
+
+let embedder = Trustmark::encoder_only("./models", Variant::Q, Version::Bch5, SessionOptions::default()).unwrap();
+let verifier = Trustmark::decoder_only("./models", Variant::Q, SessionOptions::default()).unwrap();
+```
+
+`decode` on an encoder-only model returns `Error::DecoderNotLoaded`, and `encode` on a decoder-only model returns `Error::EncoderNotLoaded`.
+
 ### Run on an NVIDIA GPU
 
 The models run on the CPU by default. With the `cuda` feature (`cargo add trustmark --features cuda`), `SessionOptions` can select ONNX Runtime's CUDA execution provider:
@@ -89,7 +102,7 @@ let options = SessionOptions {
     ..SessionOptions::default()
 };
 let tm = Trustmark::with_options("./models", Variant::Q, Version::Bch5, options).unwrap();
-println!("{:?}", tm.decoder_provider()); // requested, registered, and why it fell back if it did
+println!("{:?}", tm.decoder_provider().unwrap()); // requested, registered, and why it fell back if it did
 ```
 
 The feature makes `ort` download an ONNX Runtime 1.22 build for CUDA 12 (about 170 MB) at build time. At run time it needs:
