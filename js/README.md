@@ -41,6 +41,14 @@ To run the example:
 
 To use the code in your own project, simply include the two JavaScript files as usual.
 
+## Run the tests
+
+The data layer tests use the built-in Node.js test runner and need neither a browser nor the models. From the repository root:
+
+```
+node --test js/tests/*.test.mjs
+```
+
 ## Example output
 
 For an image containing a TrustMark watermark:
