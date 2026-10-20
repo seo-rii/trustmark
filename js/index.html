@@ -14,6 +14,7 @@
   <script src="deps/ort.webgpu.min.js"></script>
   <script src="deps/bch_ecc.min.js"></script>
   <script src="tm_datalayer.js"></script>
+  <script src="tm_core.js"></script>
   <script src="tm_watermark.js"></script>
   <style>
     * {
@@ -137,6 +138,34 @@
     #model-status.error {
       color: #a50e0e;
     }
+
+    /* Watermark embedding */
+    h2 {
+      margin: 30px 0 15px;
+      color: #333;
+    }
+    .encode-form {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      width: 100%;
+    }
+    #encode-payload {
+      width: 100%;
+      font-family: monospace;
+      padding: 6px;
+    }
+    #encode-output {
+      white-space: pre-wrap;
+      font-family: monospace;
+    }
+    #encode-output.error {
+      color: #a50e0e;
+    }
+    #encode-preview {
+      max-width: 100%;
+      height: auto;
+    }
   </style>
 </head>
 <body>
@@ -157,6 +186,19 @@
     <div class="preview-container" style="display: none;">
       <img id="preview-image" src="" alt="Preview">
       <div id="decoder-output">Watermark output will appear here...</div>
+    </div>
+  </div>
+
+  <h2>Embed a watermark (variant Q, BCH_5)</h2>
+  <div class="upload-container">
+    <div class="encode-form">
+      <input type="file" id="encode-file" accept="image/*">
+      <label for="encode-payload">Payload (up to 61 bits, shorter payloads are padded with zeros)</label>
+      <input type="text" id="encode-payload" maxlength="61" spellcheck="false">
+      <button class="browse-btn" id="encode-btn">Embed watermark</button>
+      <div id="encode-output"></div>
+      <a id="encode-download" style="display: none;">Download watermarked PNG</a>
+      <img id="encode-preview" alt="Watermarked image" style="display: none;">
     </div>
   </div>
 
@@ -281,6 +323,47 @@
       }
       return "No watermark detected.";
     }
+
+    // -- WATERMARK EMBEDDING --
+    const encodeFile = document.getElementById('encode-file');
+    const encodePayload = document.getElementById('encode-payload');
+    const encodeBtn = document.getElementById('encode-btn');
+    const encodeOutput = document.getElementById('encode-output');
+    const encodeDownload = document.getElementById('encode-download');
+    const encodePreview = document.getElementById('encode-preview');
+
+    // Start with a random payload
+    encodePayload.value = Array.from(crypto.getRandomValues(new Uint8Array(61)), (b) => b & 1).join('');
+
+    encodeBtn.addEventListener('click', async () => {
+      const file = encodeFile.files[0];
+      encodeOutput.classList.remove('error');
+      if (!file) {
+        encodeOutput.textContent = 'Choose an image first.';
+        return;
+      }
+      encodeBtn.disabled = true;
+      encodeDownload.style.display = 'none';
+      encodePreview.style.display = 'none';
+      encodeOutput.textContent = 'Embedding watermark (the encoder model is downloaded on first use)...';
+      try {
+        const result = await trustmarkEncode(file, encodePayload.value.trim());
+        const png = await imageToPngBlob(result.image);
+        if (encodeDownload.href) URL.revokeObjectURL(encodeDownload.href);
+        encodeDownload.href = URL.createObjectURL(png);
+        encodeDownload.download = file.name.replace(/\.[^.]*$/, '') + '_Q.png';
+        encodeDownload.style.display = '';
+        encodePreview.src = encodeDownload.href;
+        encodePreview.style.display = '';
+        encodeOutput.textContent = `Embedded ${result.schema} payload ${result.payload} (variant ${result.variant} on ${result.backend}).`;
+      } catch (error) {
+        console.error('Error embedding watermark:', error);
+        encodeOutput.classList.add('error');
+        encodeOutput.textContent = `Error: ${error.message}`;
+      } finally {
+        encodeBtn.disabled = false;
+      }
+    });
   </script>
 
 </body>

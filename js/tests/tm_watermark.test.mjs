@@ -41,6 +41,7 @@ function fakeOrt({ failCreate = () => null, decoderOutputs = {}, runLog = [] } =
     }
   }
   const created = [];
+  const encoderFeeds = [];
   const InferenceSession = {
     async create(model, options) {
       const name = new TextDecoder().decode(model);
@@ -55,12 +56,16 @@ function fakeOrt({ failCreate = () => null, decoderOutputs = {}, runLog = [] } =
             const size = Number(feeds.target_size.data[0]);
             return { Y: new Tensor('float32', new Float32Array(3 * size * size), [1, 3, size, size]) };
           }
+          if (name === 'encoder_Q') {
+            encoderFeeds.push(feeds);
+            return { image: feeds['onnx::Concat_0'] };
+          }
           return { output: new Tensor('float32', Float32Array.from(decoderOutputs[name]), [1, 100]) };
         },
       };
     },
   };
-  return { Tensor, InferenceSession, created };
+  return { Tensor, InferenceSession, created, encoderFeeds };
 }
 
 /** Fake fetch serving `${BASE_URL}${name}.onnx`; `gate` can hold responses back. */
@@ -101,7 +106,7 @@ function loadWatermark({ ort, fetch, autoInit = true }) {
     Image: FakeImage, document: fakeDocument,
   });
   if (!autoInit) context.TRUSTMARK_AUTO_INIT = false;
-  for (const file of ['deps/bch_ecc.min.js', 'tm_datalayer.js', 'tm_watermark.js']) {
+  for (const file of ['deps/bch_ecc.min.js', 'tm_datalayer.js', 'tm_core.js', 'tm_watermark.js']) {
     vm.runInContext(fs.readFileSync(path.join(jsDir, file), 'utf8'), context, { filename: file });
   }
   // Top-level const/let bindings are not properties of the global object
@@ -272,4 +277,49 @@ test('inferences run one at a time in FIFO order, and a failure does not stall t
   assert.deepEqual(events, ['start a', 'end a', 'start b', 'end b', 'start c', 'end c', 'start d', 'end d']);
   assert.deepEqual(outcomes.map((o) => o.status), ['fulfilled', 'rejected', 'fulfilled', 'fulfilled']);
   assert.equal(outcomes[1].reason.message, 'b failed');
+});
+
+const rgbaImage = (width, height) => ({ data: new Uint8ClampedArray(width * height * 4).fill(200), width, height });
+
+test('trustmarkEncode embeds the BCH_5 packet and records the encoder backend', async () => {
+  const ort = fakeOrt({ failCreate: (name, backend) => (backend === 'webgpu' ? 'no available backend found' : null) });
+  const tm = loadWatermark({ ort, fetch: fakeFetch() });
+
+  const result = await tm.get('trustmarkEncode')(rgbaImage(64, 48), PAYLOAD);
+
+  assert.equal(result.packet, PACKET);
+  assert.equal(result.payload, PAYLOAD);
+  assert.equal(result.schema, 'BCH_5');
+  assert.equal(result.variant, 'Q');
+  assert.equal(result.backend, 'wasm');
+  assert.equal(result.image.width, 64);
+  assert.equal(result.image.height, 48);
+  assert.equal(Array.from(ort.encoderFeeds[0]['onnx::Gemm_1'].data).join(''), PACKET);
+
+  const { models } = tm.get('trustmarkStatus')();
+  assert.equal(models.encoder_Q.status, 'ready');
+  assert.equal(models.encoder_Q.fallbackFrom, 'webgpu');
+
+  // Short payloads are padded with zeros, like the Python implementation
+  const short = await tm.get('trustmarkEncode')(rgbaImage(8, 8), '1');
+  assert.equal(short.payload, '1'.padEnd(61, '0'));
+});
+
+test('trustmarkEncode fails instead of returning an unwatermarked image', async () => {
+  const fetchLog = [];
+  const tm = loadWatermark({ ort: fakeOrt(), fetch: fakeFetch({ missing: ['encoder_Q'], log: fetchLog }) });
+  const encode = tm.get('trustmarkEncode');
+
+  // Invalid payloads are rejected before the encoder is downloaded
+  await assert.rejects(encode(rgbaImage(8, 8), '1'.repeat(62)), /62 bits but BCH_5 allows at most 61 bits/);
+  await assert.rejects(encode(rgbaImage(8, 8), 12345), /'0' and '1' characters/);
+  assert.ok(!fetchLog.some((url) => url.includes('encoder_Q')));
+
+  await assert.rejects(encode(rgbaImage(8, 8), PAYLOAD), /encoder_Q model is not loaded: could not download encoder_Q\.onnx: HTTP 404/);
+  assert.equal(tm.get('trustmarkStatus')().models.encoder_Q.status, 'error');
+});
+
+test('trustmarkEncode fails when the resizer is missing', async () => {
+  const tm = loadWatermark({ ort: fakeOrt(), fetch: fakeFetch({ missing: ['resizer'] }) });
+  await assert.rejects(tm.get('trustmarkEncode')(rgbaImage(8, 8), PAYLOAD), /resizer model is not loaded: could not download resizer\.onnx/);
 });

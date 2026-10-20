@@ -1,5 +1,5 @@
 /*!
- * TrustMark JS Watermarking Decoder Module
+ * TrustMark JS Watermarking Module
  * Copyright 2024 Adobe. All rights reserved.
  * Licensed under the MIT License.
  * 
@@ -32,6 +32,7 @@ let session_resize;
 const modelStates = {};
 
 let trustmarkInitPromise = null;
+let trustmarkOptions = null;
 let trustmarkLoaded = false;
 let resolveTrustmarkReady;
 
@@ -48,7 +49,7 @@ const trustmarkReady = new Promise((resolve) => { resolveTrustmarkReady = resolv
  *
  * @param {Object} [options]
  * @param {string} [options.modelBaseUrl] - Base URL of the ONNX model files.
- * @param {Array<string>} [options.executionProviders] - Decoder backends to try, in order.
+ * @param {Array<string>} [options.executionProviders] - Decoder and encoder backends to try, in order.
  * @returns {Promise<Object>} Resolves with trustmarkStatus().
  */
 function trustmarkInit(options = {}) {
@@ -62,6 +63,7 @@ function trustmarkInit(options = {}) {
 
   const baseUrl = options.modelBaseUrl || MODEL_BASE_URL;
   const executionProviders = options.executionProviders || DEFAULT_EXECUTION_PROVIDERS;
+  trustmarkOptions = { baseUrl, executionProviders };  // also used to load the encoder later
 
   for (const name of ['resizer', ...modelConfigs.map((config) => config.fname)]) {
     modelStates[name] = newModelState('pending');
@@ -186,169 +188,50 @@ function safeRunInference(session, feed) {
      
 
 /**
- * Converts an image URL to a tensor suitable for processing.
- * @param {string} imageUrl - The URL of the image to load.
- * @returns {Promise<ort.Tensor>} The processed tensor.
+ * Reads an image into RGBA pixels with a canvas.
+ * @param {string|Blob|ImageData} source - Image URL (e.g. a data URL), File/Blob, or an
+ *   ImageData-like { data, width, height } object, which is returned as is.
+ * @returns {Promise<ImageData>} The pixels.
  */
-async function loadImageAsTensor(imageUrl) {
-  const img = new Image();
-  img.src = imageUrl;
+async function loadImageData(source) {
+  if (source && source.data && source.width && source.height) return source;
 
-  return new Promise((resolve, reject) => {
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
-      const imgData = ctx.getImageData(0, 0, img.width, img.height);
-
-      const { data, width, height } = imgData;
-      const totalPixels = width * height;
-      const imageTensor = new Float32Array(totalPixels * 3);
-
-      let j = 0;
-      const page = width * height;
-      const twopage = 2 * page;
-
-      for (let i = 0; i < totalPixels; i++) {
-        const index = i * 4;
-        imageTensor[j] = data[index] / 255.0; // Red channel
-        imageTensor[j + page] = data[index + 1] / 255.0; // Green channel
-        imageTensor[j + twopage] = data[index + 2] / 255.0; // Blue channel
-        j++;
-      }
-
-      resolve(new ort.Tensor('float32', imageTensor, [1, 3, height, width]));
-    };
-
-    img.onerror = () => reject(new Error("Failed to load image"));
-  });
-}
-
-/**
- * Computes scale factors for image resizing with precision.
- * @param {Array<number>} targetDims - Target dimensions for the image.
- * @param {Array<number>} inputDims - Input tensor dimensions.
- * @returns {Float32Array} Scale factors as a tensor.
- */
-function computeScalesFixed(targetDims, inputDims) {
-  const [batch, channels, height, width] = inputDims;
-  const [targetHeight, targetWidth] = targetDims;
-
-  function computeScale(originalSize, targetSize) {
-    let minScale = targetSize / originalSize;
-    let maxScale = (targetSize + 1) / originalSize;
-    let scale;
-    let adjustedSize;
-
-    const tolerance = 1e-12;
-    let iterations = 0;
-    const maxIterations = 100;
-
-    while (iterations < maxIterations) {
-      scale = (minScale + maxScale) / 2;
-      adjustedSize = Math.floor(originalSize * scale + tolerance);
-
-      if (adjustedSize < targetSize) {
-        minScale = scale;
-      } else if (adjustedSize > targetSize) {
-        maxScale = scale;
-      } else {
-        break; // Found the correct scale
-      }
-
-      iterations++;
-    }
-
-    return scale;
+  const url = typeof source === 'string' ? source : URL.createObjectURL(source);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Failed to load image"));
+      img.src = url;
+    });
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    ctx.drawImage(img, 0, 0);
+    return ctx.getImageData(0, 0, img.width, img.height);
+  } finally {
+    if (url !== source) URL.revokeObjectURL(url);
   }
-
-  const scaleH = computeScale(height, targetHeight);
-  const scaleW = computeScale(width, targetWidth);
-
-  return new Float32Array([1.0, 1.0, scaleH, scaleW]);
 }
 
 /**
- * Resizes the image tensor to a square size suitable for watermark decoding.
- * @param {ort.Tensor} inputTensor - The input image tensor.
- * @param {number} targetSize - The target size for resizing.
- * @returns {Promise<ort.Tensor>} The resized tensor; rejects if the resizer is unavailable or fails.
+ * Returns the runtime that TrustmarkCore functions run models with.
+ * @returns {Object} { ort, resizer, run }
  */
-async function runResizeModelSquare(inputTensor, targetSize, force_square) {
-    try {
-        if (!session_resize) {
-            const state = modelStates.resizer;
-            throw new Error(`resizer model is not loaded${state && state.error ? `: ${state.error}` : ''}`);
-        }
-
-        const inputDims = inputTensor.dims;  // Get dimensions of the input tensor
-        const [batch, channels, height, width] = inputDims;
-        
-        // Compute the aspect ratio
-        const aspectRatio = width / height;
-        const lscape= (aspectRatio>=1.0);
-                
-        let croppedTensor = inputTensor;
-        let cropWidth = width;
-        let cropHeight = height;
-        
-        // If the aspect ratio is greater than 2.0, we need to crop the center square
-        if (lscape && (aspectRatio > 2.0 || force_square)) {
-            cropWidth = height;  // Take a square from the width
-            const offsetX = Math.floor((width - cropWidth) / 2);  // Horizontal center crop
-            croppedTensor = await cropTensor(inputTensor, offsetX, 0, cropWidth, height);
-        }
-        
-        if (!lscape && (aspectRatio < 0.5 || force_square)) {
-            cropHeight = width;  // Take a square from the height
-            const offsetY = Math.floor((height - cropHeight) / 2);  // Vertical center crop
-            croppedTensor = await cropTensor(inputTensor, 0, offsetY, width, cropHeight);
-        }
-    
-        // After cropping, resize the tensor to the target size
-        const targetDims = [targetSize, targetSize];
-        const scales = computeScalesFixed(targetDims, [batch, channels, cropHeight, cropWidth]);
-        const scalesTensor = new ort.Tensor('float32', scales, [4]);
-                
-        // Prepare the target size tensor
-        const targetSizeTensor = new ort.Tensor('int64', new BigInt64Array([BigInt(targetSize)]), [1]);
-            
-        // Set up the feeds for the model
-        const feeds = {
-            'X': croppedTensor,       // Cropped image tensor
-            'scales': scalesTensor,   // Scales tensor
-            'target_size': targetSizeTensor  // Dynamic target size tensor
-        };
-
-        const results = await safeRunInference(session_resize, feeds);
-        return results['Y'];
-            
-    } catch (error) {
-        console.error('Error during resizing:', error);
-        throw error;
-    }
+function coreRuntime() {
+  return { ort, resizer: session_resize, run: safeRunInference };
 }
 
-// Helper function to crop the tensor
-async function cropTensor(inputTensor, offsetX, offsetY, cropWidth, cropHeight) {
-    const [batch, channels, height, width] = inputTensor.dims;  
-    const croppedData = new Float32Array(batch * channels * cropWidth * cropHeight);
-    const inputData = inputTensor.data;
-         
-    let k = 0;
-    for (let c = 0; c < channels; c++) {
-        for (let y = 0; y < cropHeight; y++) {
-            for (let x = 0; x < cropWidth; x++) {
-                const srcIndex = c * width * height + (y + offsetY) * width + (x + offsetX);
-                croppedData[k++] = inputData[srcIndex];
-            }
-        }
-    }
-        
-    return new ort.Tensor('float32', croppedData, [batch, channels, cropHeight, cropWidth]);
-}                  
+/**
+ * Returns the error for a model that is not available.
+ * @param {string} name - Model name.
+ * @returns {Error} The error, including why the model failed to load.
+ */
+function modelNotLoadedError(name) {
+  const state = modelStates[name];
+  return new Error(`${name} model is not loaded${state && state.error ? `: ${state.error}` : ''}`);
+}
 
 
 /**
@@ -372,9 +255,9 @@ async function runwmark(base64Image) {
   const decoders = [];
   let found = null;
 
-  let inputTensor;
+  let image;
   try {
-    inputTensor = await loadImageAsTensor(base64Image);
+    image = await loadImageData(base64Image);
   } catch (error) {
     console.error("Error in watermark decoding:", error);
     return watermarkResult('error', null, decoders, `could not read the image: ${errorMessage(error)}`);
@@ -386,22 +269,16 @@ async function runwmark(base64Image) {
 
     const session = sessions[config.sessionVar];
     if (!session) {
-      const state = modelStates[config.fname];
-      outcome.error = `${config.fname} model is not loaded${state && state.error ? `: ${state.error}` : ''}`;
+      outcome.error = modelNotLoadedError(config.fname).message;
       continue;
     }
     outcome.backend = modelStates[config.fname].backend;
 
     try {
-      const resizedTensorWM = await runResizeModelSquare(inputTensor, config.resolution, config.squarecrop);
-
-      const feeds = { image: resizedTensorWM };
+      if (!session_resize) throw modelNotLoadedError('resizer');
 
       let startTime = new Date();
-      const results = await safeRunInference(session, feeds);
-
-      const watermarkFloat = results['output'].data;
-      const watermarkBool = watermarkFloat.map((v) => v >= 0);
+      const watermarkBool = await TrustmarkCore.decodeBits(coreRuntime(), session, image, config.resolution, config.squarecrop);
 
       const dataObj = DataLayer_Decode(watermarkBool, eccengine, config.variantcode);
       console.log(`Watermark model inference in ${(new Date() - startTime)} milliseconds`);
@@ -443,6 +320,80 @@ function watermarkResult(status, found, decoders, error) {
     error,
     decoders,
   };
+}
+
+// Watermark embedding (variant Q, schema BCH_5 only). The encoder model is only
+// downloaded when the first image is watermarked.
+const encoderConfig = { variantcode: 'Q', fname: 'encoder_Q', schema: 1 };
+let session_encoder = null;
+let encoderLoadPromise = null;
+
+/**
+ * Loads the encoder model once, after the models of trustmarkInit() (it needs the resizer).
+ * @returns {Promise<ort.InferenceSession|null>} The session, or null if it failed to load.
+ */
+function loadEncoder() {
+  if (!encoderLoadPromise) {
+    encoderLoadPromise = trustmarkInit().then(async () => {
+      session_encoder = await loadModelSession(encoderConfig.fname, trustmarkOptions.baseUrl, trustmarkOptions.executionProviders);
+      return session_encoder;
+    });
+  }
+  return encoderLoadPromise;
+}
+
+/**
+ * Embeds a TrustMark watermark (variant Q, schema BCH_5) into an image, like
+ * TrustMark.encode in the Python implementation with the default strength of 1.0.
+ * The alpha channel is kept. Rejects, rather than returning an unwatermarked image,
+ * if the payload is invalid, the image cannot be read or a model is unavailable.
+ *
+ * @param {string|Blob|ImageData} image - Image URL, File/Blob, or RGBA ImageData.
+ * @param {string} payload - Up to 61 '0'/'1' characters; shorter payloads are padded with zeros.
+ * @param {Object} [options]
+ * @param {number} [options.strength=1.0] - Watermark strength.
+ * @returns {Promise<Object>} { image: { data, width, height } (RGBA), payload (the 61 embedded
+ *   bits), packet (the 100 bits fed to the encoder), schema, variant, backend }.
+ */
+async function trustmarkEncode(image, payload, options = {}) {
+  // Validate the payload before downloading anything
+  const packet = DataLayer_Encode(payload, encoderConfig.schema, eccengine);
+
+  const encoder = await loadEncoder();
+  if (!encoder) throw modelNotLoadedError(encoderConfig.fname);
+  if (!session_resize) throw modelNotLoadedError('resizer');
+
+  const pixels = await loadImageData(image);
+  const startTime = Date.now();
+  const watermarked = await TrustmarkCore.encodeWatermark(coreRuntime(), encoder, pixels, packet, options);
+  console.log(`Watermark embedded in ${Date.now() - startTime} milliseconds`);
+
+  return {
+    image: watermarked,
+    payload: payload.padEnd(DataLayer_GetSchemaDataBits(encoderConfig.schema), '0'),
+    packet: packet.join(''),
+    schema: DataLayer_GetSchemaName(encoderConfig.schema),
+    variant: encoderConfig.variantcode,
+    backend: modelStates[encoderConfig.fname].backend,
+  };
+}
+
+/**
+ * Encodes RGBA pixels as a PNG file.
+ * The canvas stores premultiplied alpha, so the colour of semi-transparent pixels can
+ * change slightly, and fully transparent pixels lose their colour.
+ *
+ * @param {{data: Uint8ClampedArray, width: number, height: number}} image - The pixels.
+ * @returns {Promise<Blob>} The PNG.
+ */
+function imageToPngBlob(image) {
+  const canvas = document.createElement('canvas');
+  canvas.width = image.width;
+  canvas.height = image.height;
+  canvas.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('Could not encode the PNG'))), 'image/png');
+  });
 }
 
 // Load the models immediately unless the page opted out to call trustmarkInit(options) itself

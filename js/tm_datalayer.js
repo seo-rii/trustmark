@@ -57,6 +57,40 @@ function DataLayer_Decode(watermarkbool, eccengine, variant) {
 }
 
 /**
+ * Builds the 100-bit watermark packet for a binary payload: the data bits, the BCH ECC bits
+ * and 4 version bits ('00' followed by the 2-bit schema). Matches DataLayer.process_encode in
+ * the Python implementation bit for bit.
+ *
+ * @param {string} payload - String of '0' and '1' characters, at most the schema capacity
+ *   (BCH_SUPER 40, BCH_5 61, BCH_4 68, BCH_3 75 bits). Shorter payloads are padded with zeros.
+ * @param {number} version - The schema version (0 BCH_SUPER, 1 BCH_5, 2 BCH_4, 3 BCH_3).
+ * @param {Array<Object>} eccengine - Array of ECC engines indexed by schema version.
+ * @returns {Array<number>} The 100 packet bits as 0/1 numbers.
+ */
+function DataLayer_Encode(payload, version, eccengine) {
+  if (!Number.isInteger(version) || version < 0 || version >= DATALAYER_SCHEMA_COUNT) {
+    throw new Error(`Invalid schema version ${version}`);
+  }
+  if (typeof payload !== 'string' || !/^[01]*$/.test(payload)) {
+    throw new Error("The payload must be a string of '0' and '1' characters");
+  }
+  const databits = DataLayer_GetSchemaDataBits(version);
+  if (payload.length > databits) {
+    throw new Error(`The payload has ${payload.length} bits but ${DataLayer_GetSchemaName(version)} allows at most ${databits} bits`);
+  }
+
+  const data = Array.from(payload.padEnd(databits, '0'), (bit) => bit === '1');
+  const eccbits = 96 - databits;
+  const ecc = [];
+  for (const byte of BCH_Encode(eccengine[version], data)) {
+    for (let shift = 7; shift >= 0; shift--) ecc.push((byte >> shift) & 1);
+  }
+  if (ecc.length < eccbits) throw new Error(`The ECC engine returned ${ecc.length} bits, expected ${eccbits}`);
+
+  return [...data.map(Number), ...ecc.slice(0, eccbits), 0, 0, (version >> 1) & 1, version & 1];
+}
+
+/**
  * Interprets the watermark data in the context of C2PA.
  *
  * @param {Object} dataobj - The decoded watermark data object.
