@@ -66,9 +66,12 @@ impl TryFrom<ModelImage> for Value<TensorValueType<f32>> {
     fn try_from(ModelImage(size, variant, img): ModelImage) -> Result<Self, Self::Error> {
         let (w, h, xpos, ypos) = center_crop_size_and_offset(variant, &img);
 
+        // `Convolution` scales the filter support with the downscaling factor (like PIL's bilinear
+        // resize used by the Python implementation), so large images are antialiased instead of
+        // point-sampled.
         let options = ResizeOptions::new()
             .crop(xpos as f64, ypos as f64, w as f64, h as f64)
-            .resize_alg(ResizeAlg::Interpolation(
+            .resize_alg(ResizeAlg::Convolution(
                 fast_image_resize::FilterType::Bilinear,
             ));
         let modified_img = resize_img(&img, size, size, options)?;
@@ -333,5 +336,24 @@ mod tests {
         let output = remove_boundary_artifact(residual.into_dyn(), (width, height), Variant::P);
 
         assert_eq!(output.shape(), &[1, 3, 298, 256]);
+    }
+
+    #[test]
+    fn downscaling_is_antialiased() {
+        // A 1px checkerboard has no detail that survives downscaling to 256x256, so an
+        // antialiased resize turns it into flat mid-gray (0 after normalizing to [-1, 1]). A
+        // fixed-size bilinear kernel samples only the nearest pixels and aliases it instead.
+        let checkerboard =
+            GrayImage::from_fn(1000, 1000, |x, y| image::Luma([((x + y) % 2 * 255) as u8]));
+        let tensor: Value<TensorValueType<f32>> = ModelImage(256, Variant::Q, checkerboard.into())
+            .try_into()
+            .unwrap();
+        let array = tensor.try_extract_array::<f32>().unwrap();
+
+        let max_deviation = array.iter().fold(0f32, |max, x| max.max(x.abs()));
+        assert!(
+            max_deviation < 0.05,
+            "max deviation from gray: {max_deviation}"
+        );
     }
 }
