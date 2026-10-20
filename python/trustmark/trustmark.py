@@ -190,9 +190,12 @@ class TrustMark():
         elif part == 'remover':
             config.params.is_train = False  # inference mode, only load denoise module
 
-        elif part == 'detector': #detector part has the decoder and box prediction
-            # replace all other components with identity
+        elif part == 'detector': #detector part only needs the box prediction (yolo)
+            # replace all other components with identity. The bbox checkpoints hold no secret
+            # decoder weights and decode() reads the detected boxes with the main decoder,
+            # so the config's secret decoder (a ResNet-50) would only be randomly initialised
             config.params.secret_encoder_config.target = 'trustmark.model.Identity'
+            config.params.secret_decoder_config.target = 'trustmark.model.Identity'
             config.params.discriminator_config.target = 'trustmark.model.Identity'
             config.params.loss_config.target = 'trustmark.model.Identity'
             config.params.noise_config.target = 'trustmark.model.Identity'

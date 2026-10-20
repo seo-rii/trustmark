@@ -92,3 +92,40 @@ def test_decoder_only_instance_decodes(monkeypatch):
     payload = '10' * 30 + '1'
     tm.decoder = StubDecoder(tm.ecc.encode_binary([payload])[0])
     assert tm.decode(Image.new('RGB', (64, 64)), MODE='binary') == (payload, True, TrustMark.Encoding.BCH_5)
+
+
+DETECTOR_CONFIG = """
+model:
+  target: trustmark.model.TrustMark_Arch
+  params:
+    cover_key: image
+    secret_key: secret
+    secret_len: 100
+    resolution: 256
+    secret_encoder_config:
+      target: trustmark.unet.Unet1
+      params: {width: 32, ndown: 4, nmiddle: 1, activ: silu}
+    secret_decoder_config:
+      target: trustmark.unet.SecretDecoder
+      params: {arch: fasterRCNN2}
+    yolo_config:
+      target: trustmark.model.Identity
+    discriminator_config: {target: trustmark.munit.MsDCDisGP}
+    loss_config: {target: trustmark.loss.ImageSecretLoss}
+    noise_config: {target: trustmark.utils.transformations2.TransformNet}
+"""
+
+
+def test_detector_skips_unused_secret_decoder(monkeypatch, tmp_path):
+    # same structure as trustmark_bbox_{Q,P}.yaml, with a stand-in for the box predictor;
+    # the bbox checkpoints only hold 'yolo.*' weights
+    from trustmark.model import Identity
+    config_path = tmp_path / 'trustmark_bbox_Q.yaml'
+    config_path.write_text(DETECTOR_CONFIG)
+    monkeypatch.setattr(TrustMark, 'check_and_download', lambda self, filename: None)
+    monkeypatch.setattr(torch, 'load', lambda *args, **kwargs: {})
+    tm = TrustMark.__new__(TrustMark)
+    detector = tm.load_model(str(config_path), str(tmp_path / 'trustmark_bbox_Q.ckpt'), 'cpu', 100, part='detector')
+    assert isinstance(detector.decoder, Identity)
+    assert isinstance(detector.encoder, Identity)
+    assert isinstance(detector.yolo, Identity)
