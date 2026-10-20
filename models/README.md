@@ -156,3 +156,73 @@ python3 models/check_manifest.py --remote
 
 When a published file changes, update its entry (and the matching
 `MODEL_CHECKSUMS` table) and the `digests.computed` date.
+
+## Reproducing the ONNX exports
+
+[`python/tools/export_onnx.py`](../python/tools/export_onnx.py) loads the
+published PyTorch checkpoints of a variant through the `trustmark` package
+(downloading them like `TrustMark()` does), exports its encoder and decoder to
+ONNX and verifies the result. It needs `onnx` and `onnxruntime` besides the
+package's own dependencies; they are tool requirements, not package
+dependencies.
+
+```sh
+pip install -e python/ onnx onnxruntime
+# The published ONNX files to compare with, e.g. fetched by `cargo xtask fetch-models` in rust/
+python python/tools/export_onnx.py --variant Q --variant P --out exported --reference rust/models
+```
+
+The published ONNX files store float16 weights and compute in float16 behind
+float32 inputs and outputs. The tool reproduces that with the TorchScript-based
+exporter at opset 17 and the published input and output names
+(`onnx::Concat_0`, `onnx::Gemm_1` and `image` for encoders; `image` and
+`output` for decoders). `--precision float32` instead writes full precision
+`encoder_<V>_fp32.onnx` and `decoder_<V>_fp32.onnx` and its report to
+`export_report_fp32.json`. Existing files are never overwritten.
+
+It then checks, and summarizes in `export_report.json`:
+
+1. the input/output signature, opset and precision against this manifest and,
+   with `--reference`, the graph and weights against the published files;
+2. the maximum absolute output difference between the PyTorch module, the new
+   export and the published file on seeded random inputs, on the images and on
+   watermarked images, and for decoders the agreement of the decoded bits;
+3. that payloads embedded and read with the new exports, alone or combined with
+   the PyTorch modules and the published files, are recovered.
+
+Each export carries `trustmark.model_family`, `trustmark.variant`,
+`trustmark.role`, `trustmark.precision`, `trustmark.sources` (name, MD5 and
+SHA-256 of the config and checkpoint), `trustmark.preprocessing`,
+`trustmark.exporter` and `trustmark.manifest_version` in its ONNX
+`metadata_props`, and a `<file>.json` sidecar laid out like an `artifacts`
+entry of this manifest.
+
+Results on 2026-10-21 with torch 2.14.1 and onnxruntime 1.31.0, comparing with
+the published files on `images/ghost.png`, `images/ripley.jpg` and
+`images/ufo_240.jpg`:
+
+| Variant | Encoder vs published | Decoder vs published | Decoded bits on watermarked images, new vs published | Payloads recovered |
+|---|---|---|---|---|
+| Q | identical graph and weights; identical outputs | identical graph; 0.74% of weight values differ, by at most 0.002 | 300/300 | 15/15 |
+| P | identical graph and weights; identical outputs | identical graph; 1.7% of weight values differ, by at most 0.008 | 300/300 | 15/15 |
+| B | identical graph; weights differ by at most 0.004 | identical graph; weights differ by at most 0.027 | 300/300 | 15/15 |
+| C | identical graph; weights differ by at most 0.004 | identical graph; weights differ by at most 0.025 | 300/300 | 15/15 |
+
+- For Q and P the re-exported encoders differ from the published files only in
+  the producer version and the added metadata: with those reset, the files are
+  byte-identical. The decoder weight differences sit almost entirely in 1x1
+  convolutions, whose batch normalization the exporter folds into the weights,
+  and about 98% of them are one or two float16 units in the last place. The
+  cause was not determined; the published files were exported with PyTorch
+  2.2 (Q) and 2.5 (P), possibly on another device.
+- The B and C checkpoints store bfloat16 weights while the published ONNX files
+  hold float16 weights. Rounding the published float16 encoder weights to
+  bfloat16 gives the checkpoint values for 93.7% of them, the rate expected when
+  both are rounded from the same higher precision weights, which are not
+  published. A re-export from the checkpoints therefore cannot match the B and C
+  files bit for bit, but it agrees with the PyTorch modules more closely than the
+  published files do.
+- With `--precision float32`, Q's files double in size (35 and 95 MB instead of
+  17 and 47 MB) and match the PyTorch modules to within 4e-6 (encoder) and 2e-4
+  (decoder logits), against 4e-4 and 0.08 for the float16 files; decoded bits
+  and recovered payloads were the same as with float16.
