@@ -203,6 +203,19 @@ entry in `image.info`, e.g. a PNG `tRNS` chunk) is not carried over. Empty image
 `ValueError`. Very small images (below roughly 100 pixels on the short side) are
 watermarked without error but often cannot be decoded.
 
+`encode` does not apply the EXIF orientation tag: it watermarks the pixels as stored. To
+open a file upright and keep its metadata, use `trustmark.load_image`, which applies
+`ImageOps.exif_transpose` and returns the `Image.save` arguments to carry over (EXIF
+without the orientation tag, an RGB ICC profile, DPI):
+
+```python
+from trustmark import TrustMark, load_image
+
+cover, metadata = load_image('input.jpg')
+watermarked = tm.encode(cover, secret, MODE='binary')
+watermarked.save('output.png', **metadata)
+```
+
 ## Watermark removal
 
 Requires `loadRemover=True` (the default) at construction time. Calling

@@ -14,7 +14,7 @@ import torch
 from PIL import Image
 
 import trustmark
-from trustmark import TrustMark
+from trustmark import TrustMark, load_image
 from trustmark.datalayer import DataLayer
 
 PAYLOAD = ''.join('1' if i % 3 == 0 else '0' for i in range(61))
@@ -244,6 +244,79 @@ def test_invalid_concentrate_wm_region_is_rejected(monkeypatch, value):
 @pytest.mark.parametrize('value', [1, 1.0, 0.5, 0.01, np.float32(0.8)])
 def test_valid_concentrate_wm_region_is_accepted(monkeypatch, value):
     assert construct(monkeypatch, concentrate_wm_region=value).concentrate_wm_region == value
+
+
+def save_with_orientation(path, image, orientation, **kwargs):
+    exif = Image.Exif()
+    exif[0x0112] = orientation  # Orientation
+    exif[0x010F] = 'TrustMark test'  # Make
+    image.save(path, exif=exif.tobytes(), **kwargs)
+
+
+def fake_icc_profile(colour_space):
+    # only the header fields load_image looks at; 128-byte ICC header
+    header = bytearray(128)
+    header[16:20] = colour_space
+    return bytes(header)
+
+
+@pytest.mark.parametrize('orientation,transpose', [
+    (1, None),
+    (3, Image.Transpose.ROTATE_180),
+    (6, Image.Transpose.ROTATE_270),
+    (8, Image.Transpose.ROTATE_90),
+])
+def test_load_image_applies_exif_orientation(tmp_path, orientation, transpose):
+    stored = rgba_noise(size=(6, 4))
+    path = tmp_path / 'oriented.png'
+    icc = fake_icc_profile(b'RGB ')
+    save_with_orientation(path, stored, orientation, icc_profile=icc, dpi=(300, 300))
+
+    image, metadata = load_image(path)
+
+    upright = stored if transpose is None else stored.transpose(transpose)
+    assert image.mode == 'RGBA'
+    assert image.tobytes() == upright.tobytes()
+    assert sorted(metadata) == ['dpi', 'exif', 'icc_profile']
+    exif = Image.Exif()
+    exif.load(metadata['exif'])
+    assert 0x0112 not in exif
+    assert exif[0x010F] == 'TrustMark test'
+    assert metadata['icc_profile'] == icc
+    assert metadata['dpi'] == pytest.approx((300, 300), abs=0.01)
+
+
+def test_load_image_metadata_round_trips_through_save(tmp_path):
+    path = tmp_path / 'in.jpg'
+    save_with_orientation(path, rgba_noise(size=(6, 4)).convert('RGB'), 6, dpi=(72, 72))
+    image, metadata = load_image(path)
+    out = tmp_path / 'out.jpg'
+    image.save(out, **metadata)
+    with Image.open(out) as reloaded:
+        assert reloaded.size == (4, 6)
+        assert 0x0112 not in reloaded.getexif()
+        assert reloaded.getexif()[0x010F] == 'TrustMark test'
+
+
+@pytest.mark.parametrize('mode,colour_space', [('L', b'GRAY'), ('CMYK', b'CMYK')])
+def test_load_image_drops_non_rgb_icc_profile(tmp_path, mode, colour_space):
+    path = tmp_path / 'image.jpg'
+    Image.new(mode, (4, 4)).save(path, icc_profile=fake_icc_profile(colour_space))
+    image, metadata = load_image(path)
+    assert image.mode == mode
+    assert 'icc_profile' not in metadata
+
+
+def test_load_image_without_metadata(tmp_path):
+    path = tmp_path / 'plain.png'
+    Image.new('RGB', (4, 4)).save(path)
+    image, metadata = load_image(path)
+    assert metadata == {}
+    assert image.size == (4, 4)
+
+
+def test_load_image_is_exported():
+    assert trustmark.load_image is load_image
 
 
 # round trips with the real Q weights, only when they are already present (no download)

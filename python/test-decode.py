@@ -6,7 +6,7 @@
 # it.
 
 
-from trustmark import TrustMark
+from trustmark import TrustMark, load_image
 from PIL import Image
 from pathlib import Path
 import math,random
@@ -23,21 +23,16 @@ DETECTFIRST=False  # False = decode full image watermark, True = detect watermar
 tm=TrustMark(verbose=True, model_type=MODE, encoding_type=TrustMark.Encoding.BCH_5,  loadBBoxDetector=DETECTFIRST)
 
 # encoding example
-cover = Image.open(EXAMPLE_FILE)
+cover, metadata = load_image(EXAMPLE_FILE)  # upright per EXIF orientation, plus the metadata to keep
 rgb=cover.convert('RGB')
-has_alpha=cover.mode== 'RGBA'
-if (has_alpha):
-  alpha=cover.split()[-1]
 
 random.seed(1234)
 capacity=tm.schemaCapacity()
 bitstring=''.join([random.choice(['0', '1']) for _ in range(capacity)])
-encoded=tm.encode(rgb, bitstring, MODE='binary')
+encoded=tm.encode(cover, bitstring, MODE='binary')  # RGBA covers keep their alpha channel
 
-if (has_alpha):
-  encoded.putalpha(alpha)
 outfile=Path(EXAMPLE_FILE).stem+'_'+MODE+'.png'
-encoded.save(outfile, exif=cover.info.get('exif'), icc_profile=cover.info.get('icc_profile'), dpi=cover.info.get('dpi'))
+encoded.save(outfile, **metadata)
 
 
 # decoding example
@@ -56,18 +51,12 @@ if mse > 0:
   print('PSNR = %f' % psnr)
 
 # removal
-stego = Image.open(outfile)
-rgb=stego.convert('RGB')
-has_alpha=stego.mode== 'RGBA'
-if (has_alpha):
-  alpha=stego.split()[-1]
-im_recover = tm.remove_watermark(rgb)
+stego, metadata = load_image(outfile)
+im_recover = tm.remove_watermark(stego)
 rm_wm_secret, rm_wm_present, rm_wm_schema = tm.decode(im_recover, MODE='binary', DETECTFIRST=DETECTFIRST)
 if rm_wm_present and rm_wm_schema==wm_schema:
   print(f'Extracted secret: {rm_wm_secret} (schema {rm_wm_schema})')
 else:
    print('No valid secret decoded after removal')
-if (has_alpha):
-  im_recover.putalpha(alpha)
-im_recover.save('recovered.png', exif=stego.info.get('exif'), icc_profile=stego.info.get('icc_profile'), dpi=stego.info.get('dpi'))
+im_recover.save('recovered.png', **metadata)
 
