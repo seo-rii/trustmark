@@ -10,10 +10,11 @@ NOTE: The TrustMark JavaScript implementation only decodes watermarked images, i
 
 ## Components
 
-This example consists of a simple HTML file, `index.html` that loads two JavaScript files:
+This example consists of a simple HTML file, `index.html` that loads three JavaScript files:
 
 - [`tm_watermark.js`](https://github.com/adobe/trustmark/blob/main/js/tm_watermark.js), the core module that handles watermark detection and decoding and defines key functions for processing images and extracting watermark data. The `modelConfigs` array specifies parameters such as the TrustMark model variant. As provided, the code checks for both Q and P variants.
 - [`tm_datalayer.js`](https://github.com/adobe/trustmark/blob/main/js/tm_datalayer.js) handles data decoding and schema-specific processing.  It also implements error correction and interpretation of binary watermark data.
+- [`tm_core.js`](https://github.com/adobe/trustmark/blob/main/js/tm_core.js) holds the image processing shared by the watermark models (centre-square cropping and antialiased resizing). It has no DOM dependency: ONNX Runtime and the sessions are passed in, and images are `{ data, width, height }` RGBA objects. It defines the global `TrustmarkCore` when loaded as a classic script, and is a CommonJS module in Node.js (`require('./tm_core.js')`).
 
 If GPU compute is available (if you're using Google Chrome, check `chrome://gpu`), then the code will automatically use WebGPU to process the ONNX models.  If you use WebGPU it will only run in a secure context, which means on localhost or an HTTPS link.  You can start a local HTTPS server by running the `server.py` script and a suitable OpenSSL certificate in `server.pem`.  If a WebGPU session cannot be created for a model, that model falls back to WebAssembly (WASM) on the CPU, and the fallback is recorded in its load state.
 
@@ -66,7 +67,7 @@ To run the example:
 1. Open `index.html` in a browser to run the example.
 1. Drag and drop images (for example from the provided [`images`](https://github.com/adobe/trustmark/tree/main/images) directory) onto the indicated area in the web page, which will display information if the image contains a TrustMark watermark (see example below).
 
-To use the code in your own project, simply include the two JavaScript files as usual.
+To use the code in your own project, include the JavaScript files in the same order as `index.html` (`deps/ort.webgpu.min.js`, `deps/bch_ecc.min.js`, `tm_datalayer.js`, `tm_core.js`, `tm_watermark.js`).
 
 ## Run the tests
 

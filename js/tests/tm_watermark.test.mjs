@@ -101,7 +101,7 @@ function loadWatermark({ ort, fetch, autoInit = true }) {
     Image: FakeImage, document: fakeDocument,
   });
   if (!autoInit) context.TRUSTMARK_AUTO_INIT = false;
-  for (const file of ['deps/bch_ecc.min.js', 'tm_datalayer.js', 'tm_watermark.js']) {
+  for (const file of ['deps/bch_ecc.min.js', 'tm_datalayer.js', 'tm_core.js', 'tm_watermark.js']) {
     vm.runInContext(fs.readFileSync(path.join(jsDir, file), 'utf8'), context, { filename: file });
   }
   // Top-level const/let bindings are not properties of the global object
