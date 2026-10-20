@@ -1,5 +1,5 @@
 /*!
- * TrustMark JS Watermarking Decoder Module
+ * TrustMark JS Watermarking Module
  * Copyright 2024 Adobe. All rights reserved.
  * Licensed under the MIT License.
  * 
@@ -32,6 +32,7 @@ let session_resize;
 const modelStates = {};
 
 let trustmarkInitPromise = null;
+let trustmarkOptions = null;
 let trustmarkLoaded = false;
 let resolveTrustmarkReady;
 
@@ -48,7 +49,7 @@ const trustmarkReady = new Promise((resolve) => { resolveTrustmarkReady = resolv
  *
  * @param {Object} [options]
  * @param {string} [options.modelBaseUrl] - Base URL of the ONNX model files.
- * @param {Array<string>} [options.executionProviders] - Decoder backends to try, in order.
+ * @param {Array<string>} [options.executionProviders] - Decoder and encoder backends to try, in order.
  * @returns {Promise<Object>} Resolves with trustmarkStatus().
  */
 function trustmarkInit(options = {}) {
@@ -62,6 +63,7 @@ function trustmarkInit(options = {}) {
 
   const baseUrl = options.modelBaseUrl || MODEL_BASE_URL;
   const executionProviders = options.executionProviders || DEFAULT_EXECUTION_PROVIDERS;
+  trustmarkOptions = { baseUrl, executionProviders };  // also used to load the encoder later
 
   for (const name of ['resizer', ...modelConfigs.map((config) => config.fname)]) {
     modelStates[name] = newModelState('pending');
@@ -318,6 +320,80 @@ function watermarkResult(status, found, decoders, error) {
     error,
     decoders,
   };
+}
+
+// Watermark embedding (variant Q, schema BCH_5 only). The encoder model is only
+// downloaded when the first image is watermarked.
+const encoderConfig = { variantcode: 'Q', fname: 'encoder_Q', schema: 1 };
+let session_encoder = null;
+let encoderLoadPromise = null;
+
+/**
+ * Loads the encoder model once, after the models of trustmarkInit() (it needs the resizer).
+ * @returns {Promise<ort.InferenceSession|null>} The session, or null if it failed to load.
+ */
+function loadEncoder() {
+  if (!encoderLoadPromise) {
+    encoderLoadPromise = trustmarkInit().then(async () => {
+      session_encoder = await loadModelSession(encoderConfig.fname, trustmarkOptions.baseUrl, trustmarkOptions.executionProviders);
+      return session_encoder;
+    });
+  }
+  return encoderLoadPromise;
+}
+
+/**
+ * Embeds a TrustMark watermark (variant Q, schema BCH_5) into an image, like
+ * TrustMark.encode in the Python implementation with the default strength of 1.0.
+ * The alpha channel is kept. Rejects, rather than returning an unwatermarked image,
+ * if the payload is invalid, the image cannot be read or a model is unavailable.
+ *
+ * @param {string|Blob|ImageData} image - Image URL, File/Blob, or RGBA ImageData.
+ * @param {string} payload - Up to 61 '0'/'1' characters; shorter payloads are padded with zeros.
+ * @param {Object} [options]
+ * @param {number} [options.strength=1.0] - Watermark strength.
+ * @returns {Promise<Object>} { image: { data, width, height } (RGBA), payload (the 61 embedded
+ *   bits), packet (the 100 bits fed to the encoder), schema, variant, backend }.
+ */
+async function trustmarkEncode(image, payload, options = {}) {
+  // Validate the payload before downloading anything
+  const packet = DataLayer_Encode(payload, encoderConfig.schema, eccengine);
+
+  const encoder = await loadEncoder();
+  if (!encoder) throw modelNotLoadedError(encoderConfig.fname);
+  if (!session_resize) throw modelNotLoadedError('resizer');
+
+  const pixels = await loadImageData(image);
+  const startTime = Date.now();
+  const watermarked = await TrustmarkCore.encodeWatermark(coreRuntime(), encoder, pixels, packet, options);
+  console.log(`Watermark embedded in ${Date.now() - startTime} milliseconds`);
+
+  return {
+    image: watermarked,
+    payload: payload.padEnd(DataLayer_GetSchemaDataBits(encoderConfig.schema), '0'),
+    packet: packet.join(''),
+    schema: DataLayer_GetSchemaName(encoderConfig.schema),
+    variant: encoderConfig.variantcode,
+    backend: modelStates[encoderConfig.fname].backend,
+  };
+}
+
+/**
+ * Encodes RGBA pixels as a PNG file.
+ * The canvas stores premultiplied alpha, so the colour of semi-transparent pixels can
+ * change slightly, and fully transparent pixels lose their colour.
+ *
+ * @param {{data: Uint8ClampedArray, width: number, height: number}} image - The pixels.
+ * @returns {Promise<Blob>} The PNG.
+ */
+function imageToPngBlob(image) {
+  const canvas = document.createElement('canvas');
+  canvas.width = image.width;
+  canvas.height = image.height;
+  canvas.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('Could not encode the PNG'))), 'image/png');
+  });
 }
 
 // Load the models immediately unless the page opted out to call trustmarkInit(options) itself
