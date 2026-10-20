@@ -120,11 +120,29 @@
       font-family: monospace;
       background-color: #fafafa;
     }
+    #decoder-output.error {
+      border-color: #d93025;
+      color: #a50e0e;
+    }
+
+    #model-status {
+      width: 100%;
+      max-width: 600px;
+      margin: 0 auto 20px;
+      white-space: pre-wrap;
+      font-family: monospace;
+      font-size: 13px;
+      color: #555;
+    }
+    #model-status.error {
+      color: #a50e0e;
+    }
   </style>
 </head>
 <body>
 
   <h1>TrustMark JS / Client-side Decode Demonstrator</h1>
+  <div id="model-status">Loading watermark models...</div>
   <div class="upload-container">
     <div id="drop-zone">
       <p>Drag &amp; drop your image here</p>
@@ -149,8 +167,17 @@
     const previewContainer = document.querySelector('.preview-container');
     const previewImage = document.getElementById('preview-image');
     const decoderOutput = document.getElementById('decoder-output');
+    const modelStatus = document.getElementById('model-status');
 
-    const WATERMARK_MODELS_READY = () => !( (Object.values(sessions).some(session => !session) || !session_resize));
+    // Show which backend each model runs on, and any model that failed to load
+    trustmarkReady.then(({ models }) => {
+      const lines = Object.entries(models).map(([name, m]) => {
+        if (m.status !== 'ready') return `${name}: FAILED - ${m.error}`;
+        return `${name}: ${m.backend}` + (m.fallbackFrom ? ` (${m.fallbackFrom} unavailable)` : '');
+      });
+      modelStatus.textContent = 'Models: ' + lines.join(', ');
+      modelStatus.classList.toggle('error', Object.values(models).some((m) => m.status !== 'ready'));
+    });
 
     // Logging function
     function LOG(message) {
@@ -232,41 +259,27 @@
         previewContainer.style.display = 'flex';
  
         decoderOutput.textContent='';//clear log
+        decoderOutput.classList.remove('error');
+        if (!trustmarkStatus().loaded) LOG("Waiting for models to load...");
         LOG("Decoding watermark...");
 
-        const decodeInterval = setInterval(() => {
-          if (WATERMARK_MODELS_READY()) {
-            clearInterval(decodeInterval);
-            decodeImage(scaledImage)
-              .then((result) => {
-                LOG(result || "No watermark detected.");
-              })
-              .catch((error) => {
-                console.error("Error decoding watermark:", error);
-                LOG("Error decoding watermark.");
-              });
-          }
-          else {
-            console.log('Waiting for models to load');
-          }
-        }, 100);
+        // runwmark waits for the models to finish loading
+        const data = await runwmark(scaledImage);
+        decoderOutput.classList.toggle('error', data.status === 'error');
+        LOG(describeResult(data));
       };
 
       reader.readAsDataURL(file);
     }
 
-    async function decodeImage(base64Image) {
-      try {
-        const data = await runwmark(base64Image);
-        if (data.watermark_present) {
-          return `Watermark Found (${data.schema}):\n${data.watermark}\nC2PA Assertion:\n`+JSON.stringify(data.c2padata, null, 2);
-        } else {
-          return "No watermark detected.";
-        }
-      } catch (error) {
-        console.error("Error decoding watermark:", error);
-        return "Error decoding watermark.";
+    function describeResult(data) {
+      if (data.status === 'detected') {
+        return `Watermark Found (${data.schema}, variant ${data.variant} on ${data.backend}):\n${data.watermark}\nC2PA Assertion:\n`+JSON.stringify(data.c2padata, null, 2);
       }
+      if (data.status === 'error') {
+        return `Error: could not check the image for a watermark.\n${data.error}`;
+      }
+      return "No watermark detected.";
     }
   </script>
 
