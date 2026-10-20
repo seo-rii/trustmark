@@ -130,8 +130,9 @@ impl Trustmark {
         // the image is always encoded with size 256x256
         let encode_size = 256;
 
-        let input_img: Value<TensorValueType<f32>> =
-            ModelImage(encode_size, self.variant, img.clone()).try_into()?;
+        // Preprocess by reference: the image itself is still needed to apply the residual.
+        let model_img = ModelImage(encode_size, self.variant, img);
+        let input_img: Value<TensorValueType<f32>> = (&model_img).try_into()?;
         let bits: Value<TensorValueType<f32>> =
             Bits::apply_error_correction_and_schema(watermark, self.version)?.into();
         let output_img = {
@@ -140,15 +141,13 @@ impl Trustmark {
                 .lock()
                 .map_err(|_| Error::SessionLockPoisoned)?;
             let outputs = encoder.run(ort::inputs![
-                "onnx::Concat_0" => input_img,
+                "onnx::Concat_0" => &input_img,
                 "onnx::Gemm_1" => bits,
             ])?;
             outputs["image"].try_extract_array::<f32>()?.to_owned()
         };
 
-        // Need to calculate and apply the residual.
-        let input_img: Value<TensorValueType<f32>> =
-            ModelImage(encode_size, self.variant, img.clone()).try_into()?;
+        // Need to calculate and apply the residual, reusing the input tensor the encoder saw.
         let residual = (self.variant.strength_multiplier() * strength)
             * (output_img - input_img.try_extract_array::<f32>()?);
 
@@ -165,6 +164,7 @@ impl Trustmark {
         }
 
         let ModelImage(_, _, residual) = (encode_size, self.variant, residual).try_into()?;
+        let ModelImage(_, _, img) = model_img;
 
         Ok(image_processing::apply_residual(img, residual))
     }

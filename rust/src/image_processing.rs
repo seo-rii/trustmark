@@ -9,9 +9,8 @@ use std::cmp;
 
 use fast_image_resize::{ResizeAlg, ResizeOptions, Resizer};
 use image::{
-    imageops::{self, FilterType},
-    DynamicImage, GenericImageView as _, GrayAlphaImage, GrayImage, ImageBuffer, Pixel as _,
-    Rgb32FImage, RgbImage, Rgba32FImage, RgbaImage,
+    imageops::FilterType, DynamicImage, GenericImageView as _, GrayAlphaImage, GrayImage,
+    ImageBuffer, Rgb32FImage, RgbImage, Rgba32FImage, RgbaImage,
 };
 use ndarray::{s, Array, ArrayD, Axis, ShapeError};
 use ort::value::{TensorValueType, Value};
@@ -60,18 +59,20 @@ pub enum Error {
     Resize(#[from] fast_image_resize::ResizeError),
 }
 
-impl TryFrom<ModelImage> for Value<TensorValueType<f32>> {
+/// Converting a borrowed `ModelImage` leaves the image to the caller, which can keep using it
+/// without having cloned it.
+impl TryFrom<&ModelImage> for Value<TensorValueType<f32>> {
     type Error = Error;
 
-    fn try_from(ModelImage(size, variant, img): ModelImage) -> Result<Self, Self::Error> {
-        let (w, h, xpos, ypos) = center_crop_size_and_offset(variant, &img);
+    fn try_from(&ModelImage(size, variant, ref img): &ModelImage) -> Result<Self, Self::Error> {
+        let (w, h, xpos, ypos) = center_crop_size_and_offset(variant, img);
 
         let options = ResizeOptions::new()
             .crop(xpos as f64, ypos as f64, w as f64, h as f64)
             .resize_alg(ResizeAlg::Interpolation(
                 fast_image_resize::FilterType::Bilinear,
             ));
-        let modified_img = resize_img(&img, size, size, options)?;
+        let modified_img = resize_img(img, size, size, options)?;
 
         let img = modified_img.into_rgb32f().into_vec();
         let array = Array::from(img);
@@ -86,6 +87,14 @@ impl TryFrom<ModelImage> for Value<TensorValueType<f32>> {
         array.swap_axes(2, 3);
         assert_eq!(array.shape(), &[1, 3, size as usize, size as usize]);
         Ok(Value::from_array(array.to_owned())?)
+    }
+}
+
+impl TryFrom<ModelImage> for Value<TensorValueType<f32>> {
+    type Error = Error;
+
+    fn try_from(img: ModelImage) -> Result<Self, Self::Error> {
+        Self::try_from(&img)
     }
 }
 
@@ -115,44 +124,38 @@ impl TryFrom<(u32, Variant, ArrayD<f32>)> for ModelImage {
 /// Apply `residual` to the `input`.
 ///
 /// This function upscales `residual` to be the size of of `input`, then adds `residual` to the
-/// `input`.
+/// color channels of `input`. The result is an `Rgba32F` image if `input` has an alpha channel
+/// (which is kept unchanged), and an `Rgb32F` image otherwise.
 pub(super) fn apply_residual(input: DynamicImage, residual: DynamicImage) -> DynamicImage {
-    let has_alpha = input.color().has_alpha();
     let (w, h) = input.dimensions();
 
-    let applied = {
-        let input = input.clone().into_rgba32f();
-        let mut target = input.clone();
+    // Adds the upscaled residual in place to the color channels of `samples`, which holds
+    // `channels` floats per pixel. Upscaling only after the input has been converted (and
+    // dropped) keeps at most two full-size images alive.
+    let add_residual = |samples: &mut [f32], channels: usize| {
+        let residual = residual
+            .resize_exact(w, h, FilterType::Triangle)
+            .into_rgb32f();
 
-        let residual = residual.resize_exact(w, h, FilterType::Triangle);
-        let residual = residual.into_rgba32f();
-
-        for ((target, residual), original) in target
-            .pixels_mut()
-            .zip(residual.pixels())
-            .zip(input.pixels())
+        for (pixel, residual) in samples
+            .chunks_exact_mut(channels)
+            .zip(residual.chunks_exact(3))
         {
-            target.apply2(residual, |x, y| {
-                let x = convert_from_0_1_to_neg1_1!(x);
-                let y = convert_from_0_1_to_neg1_1!(y);
-
-                convert_from_neg1_1_to_0_1!(f32::min(x + y, 1.0))
-            });
-            target[3] = original[3];
+            for (x, &y) in pixel.iter_mut().zip(residual) {
+                let sum = convert_from_0_1_to_neg1_1!(*x) + convert_from_0_1_to_neg1_1!(y);
+                *x = convert_from_neg1_1_to_0_1!(f32::min(sum, 1.0));
+            }
         }
-
-        target
     };
 
-    if has_alpha {
-        let mut input = input.into_rgba32f();
-        imageops::replace(&mut input, &applied, 0, 0);
-        input.into()
+    if input.color().has_alpha() {
+        let mut output = input.into_rgba32f();
+        add_residual(&mut output, 4);
+        output.into()
     } else {
-        let mut input = input.into_rgb32f();
-        let applied = DynamicImage::ImageRgba32F(applied).into_rgb32f();
-        imageops::replace(&mut input, &applied, 0, 0);
-        input.into()
+        let mut output = input.into_rgb32f();
+        add_residual(&mut output, 3);
+        output.into()
     }
 }
 
@@ -294,6 +297,48 @@ mod tests {
         assert_eq!(convert_from_neg1_1_to_0_1!(-1.), 0.);
         assert_eq!(convert_from_neg1_1_to_0_1!(0.5), 0.75);
         assert_eq!(convert_from_neg1_1_to_0_1!(-0.1), 0.45);
+    }
+
+    #[test]
+    fn apply_residual_to_color_channels() {
+        let residual: DynamicImage = Rgb32FImage::from_fn(4, 4, |x, y| {
+            image::Rgb([0.4 + 0.05 * x as f32, 0.6 - 0.05 * y as f32, 0.6])
+        })
+        .into();
+        let input = RgbaImage::from_fn(6, 5, |x, y| {
+            image::Rgba([(x * 50) as u8, (y * 60) as u8, 255, (x * y * 12) as u8])
+        });
+
+        // Reference: add the upscaled residual in [-1, 1], saturating at 1, and keep the alpha.
+        let upscaled = residual
+            .resize_exact(6, 5, FilterType::Triangle)
+            .into_rgb32f();
+        let original = DynamicImage::ImageRgba8(input.clone()).into_rgba32f();
+        let DynamicImage::ImageRgba32F(output) =
+            apply_residual(input.clone().into(), residual.clone())
+        else {
+            panic!("RGBA input must produce an Rgba32F image");
+        };
+        for ((out, original), residual) in output
+            .pixels()
+            .zip(original.pixels())
+            .zip(upscaled.pixels())
+        {
+            for c in 0..3 {
+                let sum = (original[c] * 2. - 1.) + (residual[c] * 2. - 1.);
+                assert_eq!(out[c], (sum.min(1.) + 1.) / 2.);
+            }
+            assert_eq!(out[3], original[3]);
+        }
+
+        // The color channels of an RGB input get the same values.
+        let rgb = DynamicImage::ImageRgba8(input).to_rgb8();
+        let DynamicImage::ImageRgb32F(output_rgb) = apply_residual(rgb.into(), residual) else {
+            panic!("RGB input must produce an Rgb32F image");
+        };
+        for (rgb, rgba) in output_rgb.pixels().zip(output.pixels()) {
+            assert_eq!(rgb.0, rgba.0[..3]);
+        }
     }
 
     #[test]
