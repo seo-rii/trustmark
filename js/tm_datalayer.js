@@ -7,9 +7,12 @@
  * accordance with the terms of the Adobe license agreement accompanying it.
  */ 
 
+// Number of supported schema versions (BCH_SUPER, BCH_5, BCH_4, BCH_3)
+const DATALAYER_SCHEMA_COUNT = 4;
+
 // Initialize ECC engines for all supported versions
 let eccengine = [];
-for (let version = 0; version < 4; version++) {
+for (let version = 0; version < DATALAYER_SCHEMA_COUNT; version++) {
   eccengine.push(DataLayer_GetECCEngine(version));
 }
 
@@ -20,35 +23,37 @@ for (let version = 0; version < 4; version++) {
  * @param {Array<boolean>} watermarkbool - The boolean array representing the watermark.
  * @param {Array<Object>} eccengine - Array of ECC engines for decoding.
  * @returns {Object} Decoded watermark data with schema and soft binding info.
+ *   softBindingInfo is null when no schema yields a valid watermark.
  */
 function DataLayer_Decode(watermarkbool, eccengine, variant) {
-  let version = DataLayer_GetVersion(watermarkbool);
-  let databits = DataLayer_GetSchemaDataBits(version);
+  const hinted = DataLayer_GetVersion(watermarkbool);
 
-  let data = watermarkbool.slice(0, databits);
-  let ecc = watermarkbool.slice(databits, 96);
-
-  let dataobj = BCH_Decode(eccengine[version], data, ecc);
-  dataobj.schema = DataLayer_GetSchemaName(version);
-
-  if (!dataobj.valid) {
-    // Attempt decoding with alternate schemas
-    for (let alt = 0; alt < 3; alt++) {
-      if (alt === version) continue;
-
-      databits = DataLayer_GetSchemaDataBits(alt);
-      data = watermarkbool.slice(0, databits);
-      ecc = watermarkbool.slice(databits, 96);
-
-      dataobj = BCH_Decode(eccengine[alt], data, ecc);
-      dataobj.schema = DataLayer_GetSchemaName(alt);
-      if (dataobj.valid) break;
-    }
+  // Try the schema signalled by the version bits first. Those bits are not
+  // protected by the ECC, so fall back to every other schema if they are corrupt.
+  const candidates = [hinted];
+  for (let alt = 0; alt < DATALAYER_SCHEMA_COUNT; alt++) {
+    if (alt !== hinted) candidates.push(alt);
   }
 
-  // Add soft binding information
-  dataobj.softBindingInfo = formatSoftBindingData(dataobj.data_binary, version, variant);
-  return dataobj;
+  let primary = null;
+  for (const version of candidates) {
+    const databits = DataLayer_GetSchemaDataBits(version);
+    const data = watermarkbool.slice(0, databits);
+    const ecc = watermarkbool.slice(databits, 96);
+
+    const dataobj = BCH_Decode(eccengine[version], data, ecc);
+    dataobj.schema = DataLayer_GetSchemaName(version);
+    if (dataobj.valid) {
+      // Use the schema that actually recovered the data, not the hinted one
+      dataobj.softBindingInfo = formatSoftBindingData(dataobj.data_binary, version, variant);
+      return dataobj;
+    }
+    if (primary === null) primary = dataobj;
+  }
+
+  // No schema recovered the data, so there is no soft binding to report
+  primary.softBindingInfo = null;
+  return primary;
 }
 
 /**
