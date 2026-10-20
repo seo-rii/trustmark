@@ -43,13 +43,13 @@ However, C2PA metadata can be accidentally removed when the image is shared thro
 
 ### Does TrustMark alter metadata or EXIF information?
 
-No, TrustMark only modifies pixel data and does not interact with image metadata. The software libraries (e.g., [PIL](https://pypi.org/project/pillow/) in Python) should be used to persist metadata between the input and output image (as shown in the [Python code example](https://github.com/adobe/trustmark/blob/main/python/test.py)).
+No, TrustMark only modifies pixel data and does not interact with image metadata. The software libraries (e.g., [PIL](https://pypi.org/project/pillow/) in Python) should be used to persist metadata between the input and output image (as shown in the [Python code example](https://github.com/adobe/trustmark/blob/main/python/test-decode.py)).
 
 ## Technical Details
 
 ### Does TrustMark support my image format?
 
-TrustMark operates on pixels in **RGB space** and is **format agnostic**. The code samples in this repository use standard libraries to load and save images in most formats and may be substituted for other libraries if needed. For example, using Python [PIL](https://pypi.org/project/pillow/), it is possible to load PNG, JPEG, WEBP formats and more. The alpha channel is not considered during watermarking. Please refer to the [code](python/test.py) where we show how to remove the alpha channel, watermark the image, and restore the alpha channel to handle transparent images (e.g., RGBA PNGs).
+TrustMark operates on pixels in **RGB space** and is **format agnostic**. The code samples in this repository use standard libraries to load and save images in most formats and may be substituted for other libraries if needed. For example, using Python [PIL](https://pypi.org/project/pillow/), it is possible to load PNG, JPEG, WEBP formats and more. The alpha channel is not considered during watermarking. Please refer to the [code](python/test-decode.py) where we show how to remove the alpha channel, watermark the image, and restore the alpha channel to handle transparent images (e.g., RGBA PNGs).
 
 ### Does TrustMark work on grayscale images?
 

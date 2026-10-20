@@ -44,7 +44,7 @@ encoded_image = tm.encode(input_image, payload="example", WM_STRENGTH=1.5)
 ## Error correction level
 
 TrustMark encodes a payload (the watermark data embedded within the image) of 100 bits.
-The data schema implemented in `python/datalayer.py` enables you to choose an error correction level over the raw 100 bits of payload to maintain reliability under transformations or noise. 
+The data schema implemented in `python/trustmark/datalayer.py` enables you to choose an error correction level over the raw 100 bits of payload to maintain reliability under transformations or noise. 
 
 ### Encoding modes
 
