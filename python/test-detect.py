@@ -49,11 +49,13 @@ else:
   print('No watermark detected')
 
 # psnr (quality, higher is better)
-mse = np.mean(np.square(np.subtract(np.asarray(stego).astype(np.int16), np.asarray(rgb).astype(np.int16))))
+mse = np.mean(np.square(np.asarray(stego, dtype=np.float64) - np.asarray(rgb, dtype=np.float64)))
 if mse > 0:
   PIXEL_MAX = 255.0
   psnr= 20 * math.log10(PIXEL_MAX) - 10 * math.log10(mse)
-  print('PSNR = %f' % psnr)
+else:
+  psnr = math.inf  # identical images
+print('PSNR = %f' % psnr)
 
 # removal
 stego = Image.open(outfile)
