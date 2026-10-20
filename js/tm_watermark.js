@@ -224,7 +224,18 @@ async function cropTensor(inputTensor, offsetX, offsetY, cropWidth, cropHeight) 
     }
         
     return new ort.Tensor('float32', croppedData, [batch, channels, cropHeight, cropWidth]);
-}                  
+}
+
+/**
+ * Rescales a resized image tensor from [0, 1] to the [-1, 1] range the watermark decoders
+ * were trained on (the Python and Rust implementations feed the same range).
+ * @param {ort.Tensor} tensor - The resized image tensor with values in [0, 1].
+ * @returns {ort.Tensor} The decoder input tensor.
+ */
+function toDecoderInput(tensor) {
+    const data = Float32Array.from(tensor.data, (v) => v * 2.0 - 1.0);
+    return new ort.Tensor('float32', data, tensor.dims);
+}
 
 
 /**
@@ -252,7 +263,7 @@ async function runwmark(base64Image) {
         const resizedTensorWM = await runResizeModelSquare(inputTensor, config.resolution, config.squarecrop);
         if (!resizedTensorWM) throw new Error("Failed to resize tensor for watermark detection.");
 
-        const feeds = { image: resizedTensorWM };
+        const feeds = { image: toDecoderInput(resizedTensorWM) };
 
         let startTime = new Date();
         const results = await safeRunInference(session, feeds);
