@@ -97,7 +97,7 @@ Each `model_type` (`C`, `Q`, `B`, or `P`) needs a subset of these files, named
 | `decoder_{TYPE}.ckpt` | decoder weights | always |
 | `encoder_{TYPE}.ckpt` | encoder weights | always |
 | `trustmark_rm_{TYPE}.yaml`, `trustmark_rm_{TYPE}.ckpt` | remover config/weights | `loadRemover=True` (default) |
-| `trustmark_bbox_{TYPE}.yaml`, `trustmark_bbox_{TYPE}.ckpt` | bbox detector config/weights | `loadBBoxDetector=True`; **only published for `Q` and `P`** |
+| `trustmark_bbox_{TYPE}.yaml`, `trustmark_bbox_{TYPE}.ckpt` | bbox detector config/weights | `loadBBoxDetector=True`; **only published for `Q` and `P`** (`B`/`C` raise `ValueError`) |
 
 Download each file from `https://cai-watermark.adobe.net/watermarking/trustmark-models/<filename>`, e.g.:
 
@@ -125,6 +125,10 @@ decoding (e.g. a cropped or composited image):
 tm = TrustMark(model_type='Q', loadRemover=False, loadBBoxDetector=True)
 wm_secret, wm_present, wm_schema = tm.decode(img, MODE='binary', DETECTFIRST=True)
 ```
+
+`DETECTFIRST=True` raises `RuntimeError` if the detector is not loaded. With
+`ROTATION=True` as well, every rotation is localized and its boxes decoded until one
+succeeds.
 
 ## Model variants
 
@@ -156,7 +160,7 @@ chosen encoding — do not hardcode the number.
 tm.decode(
     img,
     MODE='binary',        # 'binary' (bit string) or 'text' (7-bit ASCII string)
-    DETECTFIRST=False,    # True = run bbox detector first (requires loadBBoxDetector=True)
+    DETECTFIRST=False,    # True = run bbox detector first (requires loadBBoxDetector=True, else RuntimeError)
     ROTATION=False,       # True = try 0/90/180/270° rotations
 )
 # returns: (secret_string, wm_present: bool, wm_schema: int)
