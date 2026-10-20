@@ -5,7 +5,7 @@ description = "TrustMark: Universal Watermarking for Arbitrary Resolution Images
 readme = "README.md" 
 requires-python = ">=3.8.5"
 
-license = {file = "LICENSE.txt"}
+license = {file = "LICENSE"}
 
 keywords = ["watermarking", "CAI", "watermark", "Content Authenticity Initiative", "provenance"]  # Optional
 
