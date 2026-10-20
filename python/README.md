@@ -104,6 +104,24 @@ im_recover = tm.remove_watermark(stego)
 im_recover.save('images/recovered.png')
 ```
 
+## Model files
+
+By default, model files are downloaded on first use into the `models` folder of the installed `trustmark` package, and each file is checked against its published MD5 checksum before use.
+
+To keep the model files somewhere else, for example when the package directory is read-only or to share one copy between environments, pass `model_dir`. The directory is created if a file needs to be downloaded:
+
+```python
+tm = TrustMark(model_type='Q', model_dir='/opt/trustmark-models')
+```
+
+For offline or air-gapped deployments, place the model files in `model_dir` beforehand and pass `allow_download=False`. TrustMark then never accesses the network, and a missing file or one that fails the checksum is reported as an error naming the file and directory:
+
+```python
+tm = TrustMark(model_type='Q', loadRemover=False, model_dir='/opt/trustmark-models', allow_download=False)
+```
+
+Model type `Q` with `loadRemover=False` needs `trustmark_Q.yaml`, `encoder_Q.ckpt` and `decoder_Q.ckpt`; the remover adds `trustmark_rm_Q.yaml` and `trustmark_rm_Q.ckpt`, and the bounding box detector (`loadBBoxDetector=True`) adds `trustmark_bbox_Q.yaml` and `trustmark_bbox_Q.ckpt`. Other model types use the same names with their own letter (the detector is only published for `Q` and `P`). Each file can be downloaded from `https://cai-watermark.adobe.net/watermarking/trustmark-models/<filename>`.
+
 ## Data schema
 
 TrustMark encodes a payload (the watermark data embedded within the image) of 100 bits.

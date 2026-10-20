@@ -83,8 +83,10 @@ class TrustMark():
        BCH_4=2
        BCH_5=1
 
-    def __init__(self, use_ECC=True, verbose=True, secret_len=100, device='', model_type='Q', encoding_type=Encoding.BCH_5, concentrate_wm_region=CONCENTRATE_WM_REGION, loadRemover=True, loadBBoxDetector=False):
+    def __init__(self, use_ECC=True, verbose=True, secret_len=100, device='', model_type='Q', encoding_type=Encoding.BCH_5, concentrate_wm_region=CONCENTRATE_WM_REGION, loadRemover=True, loadBBoxDetector=False, model_dir=None, allow_download=True):
         # Initializes the TrustMark watermark encoder/decoder/remover/detector module
+        # model_dir: directory holding the model files; None uses the models/ folder inside the package
+        # allow_download: fetch missing or corrupt model files from MODEL_REMOTE_HOST; False never accesses the network
 
         super(TrustMark, self).__init__()
 
@@ -100,14 +102,18 @@ class TrustMark():
         assert model_type in ['C', 'Q', 'B', 'P']
         self.model_type = model_type
 
+        if model_dir is None:
+            model_dir=os.path.join(pathlib.Path(__file__).parent.resolve(),'models')
+        self.model_dir=os.path.abspath(os.fspath(model_dir))
+        self.allow_download=allow_download
 
-        locations={'config' : os.path.join(pathlib.Path(__file__).parent.resolve(),f'models/trustmark_{self.model_type}.yaml'), 
-                   'config-rm' : os.path.join(pathlib.Path(__file__).parent.resolve(),f'models/trustmark_rm_{self.model_type}.yaml'), 
-                   'decoder': os.path.join(pathlib.Path(__file__).parent.resolve(),f'models/decoder_{self.model_type}.ckpt'), 
-                   'remover': os.path.join(pathlib.Path(__file__).parent.resolve(),f'models/trustmark_rm_{self.model_type}.ckpt'),
-                   'encoder': os.path.join(pathlib.Path(__file__).parent.resolve(),f'models/encoder_{self.model_type}.ckpt'),
-                   'detector': os.path.join(pathlib.Path(__file__).parent.resolve(),f'models/trustmark_bbox_{self.model_type}.ckpt'),
-                   'config-detector': os.path.join(pathlib.Path(__file__).parent.resolve(),f'models/trustmark_bbox_{self.model_type}.yaml')}
+        locations={'config' : os.path.join(self.model_dir,f'trustmark_{self.model_type}.yaml'),
+                   'config-rm' : os.path.join(self.model_dir,f'trustmark_rm_{self.model_type}.yaml'),
+                   'decoder': os.path.join(self.model_dir,f'decoder_{self.model_type}.ckpt'),
+                   'remover': os.path.join(self.model_dir,f'trustmark_rm_{self.model_type}.ckpt'),
+                   'encoder': os.path.join(self.model_dir,f'encoder_{self.model_type}.ckpt'),
+                   'detector': os.path.join(self.model_dir,f'trustmark_bbox_{self.model_type}.ckpt'),
+                   'config-detector': os.path.join(self.model_dir,f'trustmark_bbox_{self.model_type}.yaml')}
 
         self.use_ECC = use_ECC
         self.secret_len = secret_len
@@ -154,8 +160,14 @@ class TrustMark():
                  valid= (expected==md5(file).hexdigest())
 
         if not valid:
-            print('Fetching model file (once only): '+filename)
             urld=MODEL_REMOTE_HOST+name
+            if not self.allow_download:
+                dirname=os.path.dirname(os.path.abspath(filename))
+                if not os.path.isfile(filename):
+                    raise FileNotFoundError(f'Model file {name} not found in {dirname} and downloads are disabled (allow_download=False); get it from {urld}')
+                raise OSError(f'Model file {name} in {dirname} does not match its expected md5 {expected} and downloads are disabled (allow_download=False); get it again from {urld}')
+
+            print('Fetching model file (once only): '+filename)
 
             # Download to a uniquely named temporary file next to the target and verify it before
             # atomically moving it into place, so an interrupted or corrupt download never appears
@@ -164,6 +176,7 @@ class TrustMark():
             try:
                 digest=md5()
                 try:
+                    os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
                     fd=os.open(tmpname, os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os, 'O_BINARY', 0), 0o666)
                     with os.fdopen(fd, 'wb') as out, urllib.request.urlopen(urld, timeout=MODEL_DOWNLOAD_TIMEOUT) as response:
                         for chunk in iter(lambda: response.read(1<<20), b''):
