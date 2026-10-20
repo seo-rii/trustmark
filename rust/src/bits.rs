@@ -5,7 +5,10 @@
 // accordance with the terms of the Adobe license agreement accompanying
 // it.
 
-use std::{fmt::Display, str::FromStr};
+use std::{
+    fmt::{Debug, Display},
+    str::FromStr,
+};
 
 use ndarray::{Array1, ArrayD, Axis};
 use ort::value::{TensorValueType, Value};
@@ -132,6 +135,43 @@ impl Bits {
     /// resort, this function checks for bitflips in the version identifier by trying all possible
     /// versions.
     fn new(s: String) -> Result<Self, Error> {
+        let schema_version = Bits::schema_version(&s)?;
+        evaluation_order(schema_version)
+            .find_map(|version| Bits::new_with_version(&s, version, false).ok())
+            .map(|(bits, _)| bits)
+            .ok_or(Error::CorruptWatermark)
+    }
+
+    /// Decode a bitstring under `options`, collecting every version that passes the BCH check.
+    pub(super) fn decode_with(s: &str, options: &DecodeOptions) -> Result<Decoded, Error> {
+        let schema_version = Bits::schema_version(s)?;
+        let candidates: Vec<Candidate> = evaluation_order(schema_version)
+            .filter_map(|version| {
+                let (bits, corrected_bits) =
+                    Bits::new_with_version(s, version, options.padding_check).ok()?;
+                Some(Candidate {
+                    version,
+                    payload: bits.get_data(),
+                    corrected_bits: corrected_bits.into(),
+                })
+            })
+            .collect();
+        let accepted = candidates
+            .iter()
+            .find(|candidate| options.accepts(candidate.version, schema_version))
+            .ok_or(Error::CorruptWatermark)?;
+
+        Ok(Decoded {
+            payload: accepted.payload.clone(),
+            version: accepted.version,
+            corrected_bits: accepted.corrected_bits,
+            schema_version,
+            candidates,
+        })
+    }
+
+    /// Check that `s` is a 100 bit bitstring and return the version its schema bits name, if any.
+    fn schema_version(s: &str) -> Result<Option<Version>, Error> {
         if s.chars().any(|c| c != '0' && c != '1') {
             return Err(Error::InvalidChar);
         }
@@ -140,30 +180,19 @@ impl Bits {
             return Err(Error::InvalidLength);
         }
 
-        let version: Version = Version::from_bitstring(&s[96..]).unwrap_or_default();
-
-        if let Ok(bits) = Bits::new_with_version(&s, version) {
-            Ok(bits)
-        } else {
-            let mut versions = vec![
-                Version::Bch3,
-                Version::Bch4,
-                Version::Bch5,
-                Version::BchSuper,
-            ];
-            versions.retain(|v| *v != version);
-            let mut res = None;
-            for version in versions {
-                res = Some(Bits::new_with_version(&s, version));
-                if res.as_ref().unwrap().is_ok() {
-                    return res.unwrap();
-                }
-            }
-            res.unwrap()
-        }
+        Ok(Version::from_bitstring(&s[96..]).ok())
     }
 
-    fn new_with_version(s: &str, version: Version) -> Result<Self, Error> {
+    /// Check and correct `s` as `version`, returning the corrected bits and the number of
+    /// corrected bit flips.
+    ///
+    /// With `padding_check`, a correction in the zero bits that pad the payload to a whole byte is
+    /// an error.
+    fn new_with_version(
+        s: &str,
+        version: Version,
+        padding_check: bool,
+    ) -> Result<(Self, u8), Error> {
         let data_bits: usize = version.data_bits().into();
         let ecc_bits: usize = version.ecc_bits().into();
 
@@ -194,6 +223,13 @@ impl Bits {
             return Err(Error::CorruptWatermark);
         }
 
+        // No encoder sets the padding bits, so a correction there means the bits are not within
+        // the correction capacity of any packet an encoder can produce.
+        let padding_mask = (1u8 << (data_bits.next_multiple_of(8) - data_bits)) - 1;
+        if padding_check && data.last().is_some_and(|byte| byte & padding_mask != 0) {
+            return Err(Error::CorruptWatermark);
+        }
+
         // unpack data and ecc
         let mut data: String = data
             .iter()
@@ -208,8 +244,210 @@ impl Bits {
         data.truncate(data_bits);
         ecc.truncate(ecc_bits);
 
-        Ok(Bits(format!("{data}{ecc}{}", version.bitstring())))
+        Ok((
+            Bits(format!("{data}{ecc}{}", version.bitstring())),
+            bitflips,
+        ))
     }
+}
+
+/// The order in which versions are tried: the one named by the schema bits (or the default version
+/// when they name none), then the others.
+fn evaluation_order(schema_version: Option<Version>) -> impl Iterator<Item = Version> {
+    let first = schema_version.unwrap_or_default();
+    std::iter::once(first).chain(
+        [
+            Version::Bch3,
+            Version::Bch4,
+            Version::Bch5,
+            Version::BchSuper,
+        ]
+        .into_iter()
+        .filter(move |version| *version != first),
+    )
+}
+
+/// Threshold the decoder's output into a bitstring.
+pub(super) fn bitstring(array: ArrayD<f32>) -> Result<String, Error> {
+    if array.shape() != [1, 100] {
+        return Err(Error::InvalidDim);
+    }
+    Ok(array
+        .iter()
+        .map(|bit| if *bit < 0. { '0' } else { '1' })
+        .collect())
+}
+
+/// Which watermarks [`Trustmark::decode_with`](crate::Trustmark::decode_with) accepts.
+///
+/// Every watermark ends in four schema bits that name its [`Version`]. Those bits are not protected
+/// by the error correction, so by default (the behaviour of
+/// [`Trustmark::decode`](crate::Trustmark::decode)) a packet that fails the BCH check under the
+/// version its schema bits name is tried under every other version, and the first one that passes
+/// wins. That recovers watermarks whose schema bits were damaged, but it also lets a damaged or
+/// unwatermarked image pass as a weaker version with a payload that was never embedded.
+///
+/// Passing the BCH check only means that the bits are within the version's correction capacity of
+/// some valid codeword. It is not authentication and not proof of provenance. Of 100,000 uniformly
+/// random 100-bit strings, 10.1% pass the default options (8.5% as [`Version::Bch3`]), 0.57% pass
+/// [`strict`](Self::strict) options, and 0.21% pass when only [`Version::Bch5`] is allowed. About
+/// 9% of genuine [`Version::BchSuper`], [`Version::Bch5`] and [`Version::Bch4`] watermarks also
+/// pass the BCH check as [`Version::Bch3`], so one whose schema bits were damaged can decode to a
+/// payload that was never embedded; see [`Decoded::is_ambiguous`].
+///
+/// When the embedding version is known, allowing only it with
+/// [`with_allowed_versions`](Self::with_allowed_versions) both ignores damaged schema bits and
+/// accepts the least noise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DecodeOptions {
+    /// Bit set of allowed versions, indexed by `Version::schema_id`.
+    allowed: u8,
+    fallback: bool,
+    padding_check: bool,
+}
+
+impl Default for DecodeOptions {
+    fn default() -> Self {
+        Self {
+            allowed: 0b1111,
+            fallback: true,
+            padding_check: false,
+        }
+    }
+}
+
+impl DecodeOptions {
+    /// Allow every version, fall back from the schema bits and accept corrections in the padding,
+    /// like [`Trustmark::decode`](crate::Trustmark::decode).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accept only the version named by the schema bits, and reject corrections in the padding.
+    ///
+    /// This is `DecodeOptions::new().with_fallback(false).with_padding_check(true)`. It rejects
+    /// watermarks whose schema bits were damaged instead of guessing their version.
+    pub fn strict() -> Self {
+        Self::new().with_fallback(false).with_padding_check(true)
+    }
+
+    /// Accept only the given versions.
+    ///
+    /// Pass a single version when the watermark is known to have been embedded with it. Versions
+    /// that are not allowed are still checked and reported in [`Decoded::candidates`], but never
+    /// accepted. An empty set rejects every watermark.
+    #[must_use]
+    pub fn with_allowed_versions(mut self, versions: impl IntoIterator<Item = Version>) -> Self {
+        self.allowed = versions
+            .into_iter()
+            .fold(0, |allowed, version| allowed | 1 << version.schema_id());
+        self
+    }
+
+    /// Whether versions other than the one named by the schema bits may be accepted (default
+    /// `true`).
+    ///
+    /// With `false`, only the version named by the four schema bits is accepted, and a watermark
+    /// whose schema bits are not one of the four defined patterns (`0000` to `0011`) is rejected.
+    /// The Python reference decoder reads only the last two schema bits and never falls back.
+    #[must_use]
+    pub fn with_fallback(mut self, fallback: bool) -> Self {
+        self.fallback = fallback;
+        self
+    }
+
+    /// Whether to reject bits that only pass the BCH check by correcting one of the zero bits
+    /// that pad the payload to a whole byte (default `false`).
+    ///
+    /// No encoder sets those bits, so bits that need such a correction are further than the
+    /// version's correction capacity from every packet an encoder can produce, and a watermark with
+    /// no more bit flips than the capacity never needs one. The check lowers the share of random
+    /// 100-bit strings that pass the default options from 10.1% to 8.7%.
+    /// [`Trustmark::decode`](crate::Trustmark::decode) and the Python and JavaScript decoders
+    /// accept these corrections; the C++ decoder rejects them. A version that fails the check is
+    /// not listed in [`Decoded::candidates`].
+    #[must_use]
+    pub fn with_padding_check(mut self, padding_check: bool) -> Self {
+        self.padding_check = padding_check;
+        self
+    }
+
+    fn accepts(&self, version: Version, schema_version: Option<Version>) -> bool {
+        self.allowed & 1 << version.schema_id() != 0
+            && (self.fallback || schema_version == Some(version))
+    }
+}
+
+impl Debug for DecodeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let allowed: Vec<Version> = [
+            Version::BchSuper,
+            Version::Bch5,
+            Version::Bch4,
+            Version::Bch3,
+        ]
+        .into_iter()
+        .filter(|version| self.allowed & 1 << version.schema_id() != 0)
+        .collect();
+        f.debug_struct("DecodeOptions")
+            .field("allowed_versions", &allowed)
+            .field("fallback", &self.fallback)
+            .field("padding_check", &self.padding_check)
+            .finish()
+    }
+}
+
+/// A watermark decoded by [`Trustmark::decode_with`](crate::Trustmark::decode_with).
+///
+/// Passing the BCH check is not proof that the image carries this watermark; see
+/// [`DecodeOptions`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Decoded {
+    /// The decoded payload bits, as returned by [`Trustmark::decode`](crate::Trustmark::decode).
+    pub payload: String,
+    /// The version the payload was decoded with.
+    pub version: Version,
+    /// How many bit flips the BCH decoder corrected in the payload and error correction bits.
+    /// Flips in the four schema bits are not counted.
+    pub corrected_bits: u32,
+    /// The version named by the four schema bits, or `None` if they are not one of the defined
+    /// patterns.
+    pub schema_version: Option<Version>,
+    /// Every version under which the bits pass the BCH check (and the padding check, if enabled),
+    /// whether or not the options allow it, in the order they are tried: the version named by the
+    /// schema bits (or [`Version::BchSuper`] when they name none) first, then [`Version::Bch3`],
+    /// [`Version::Bch4`], [`Version::Bch5`] and [`Version::BchSuper`]. The accepted version is the
+    /// first allowed one.
+    pub candidates: Vec<Candidate>,
+}
+
+impl Decoded {
+    /// Whether the accepted version differs from the one named by the schema bits, so it was found
+    /// by trying other versions.
+    pub fn used_fallback(&self) -> bool {
+        self.schema_version != Some(self.version)
+    }
+
+    /// Whether the bits pass the BCH check under more than one version.
+    ///
+    /// Versions have different payload lengths, so each candidate has a different payload. Only
+    /// the schema bits (or the caller's knowledge of the embedding version) tell them apart.
+    pub fn is_ambiguous(&self) -> bool {
+        self.candidates.len() > 1
+    }
+}
+
+/// A version under which decoded bits pass the BCH check; see [`Decoded::candidates`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Candidate {
+    /// The version.
+    pub version: Version,
+    /// The payload bits under this version.
+    pub payload: String,
+    /// How many bit flips the BCH decoder corrected under this version.
+    pub corrected_bits: u32,
 }
 
 impl From<Bits> for Value<TensorValueType<f32>> {
@@ -232,22 +470,12 @@ impl TryFrom<ArrayD<f32>> for Bits {
     type Error = Error;
 
     fn try_from(array: ArrayD<f32>) -> Result<Self, Self::Error> {
-        if array.shape() != [1, 100] {
-            return Err(Error::InvalidDim);
-        }
-        let array = array.remove_axis(Axis(0));
-        let mut s = String::new();
-        for bit in array.iter() {
-            let c = if *bit < 0. { '0' } else { '1' };
-            s.push(c);
-        }
-
-        Bits::new(s)
+        Bits::new(bitstring(array)?)
     }
 }
 
 /// The error correction schema
-#[derive(Debug, Default, Copy, Clone, PartialEq)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Version {
     /// Tolerates 8 bit flips
     #[default]
@@ -328,6 +556,16 @@ impl Version {
             "0011" => Version::Bch3,
             _ => return Err(Error::InvalidVersion),
         })
+    }
+
+    /// The value of the schema bits that indicate this version.
+    fn schema_id(&self) -> u8 {
+        match self {
+            Version::BchSuper => 0,
+            Version::Bch5 => 1,
+            Version::Bch4 => 2,
+            Version::Bch3 => 3,
+        }
     }
 
     /// Get the number of error correcting bits for this version.
@@ -497,6 +735,255 @@ mod tests {
                 let bits = Bits::new(input.to_string()).unwrap();
                 assert_eq!(bits.get_version(), *version);
                 assert_eq!(bits.get_data(), *payload);
+            }
+        }
+    }
+
+    fn decode(s: &str, options: DecodeOptions) -> Result<Decoded, Error> {
+        Bits::decode_with(s, &options)
+    }
+
+    /// Replace the four schema bits of `packet`.
+    fn with_schema(packet: &str, schema: &str) -> String {
+        format!("{}{schema}", &packet[..96])
+    }
+
+    #[test]
+    fn default_options_match_new() {
+        for (_, _, packet, corrupted) in PYTHON_PACKETS {
+            for input in [packet, corrupted] {
+                for schema in 0..16 {
+                    let s = with_schema(input, &format!("{schema:04b}"));
+                    let new =
+                        Bits::new(s.clone()).map(|bits| (bits.get_version(), bits.get_data()));
+                    let decoded =
+                        decode(&s, DecodeOptions::default()).map(|d| (d.version, d.payload));
+                    match (new, decoded) {
+                        (Ok(new), Ok(decoded)) => assert_eq!(new, decoded, "{s}"),
+                        (Err(Error::CorruptWatermark), Err(Error::CorruptWatermark)) => {}
+                        (new, decoded) => panic!("{s}: {new:?} != {decoded:?}"),
+                    }
+                }
+            }
+        }
+        assert!(matches!(
+            decode(&"1".repeat(100), DecodeOptions::default()),
+            Err(Error::CorruptWatermark)
+        ));
+        assert!(matches!(
+            decode(&"2".repeat(100), DecodeOptions::default()),
+            Err(Error::InvalidChar)
+        ));
+        assert!(matches!(
+            decode(&"0".repeat(99), DecodeOptions::default()),
+            Err(Error::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn decoded_reports_version_and_corrected_bits() {
+        for (version, payload, packet, corrupted) in PYTHON_PACKETS {
+            let clean = decode(packet, DecodeOptions::default()).unwrap();
+            assert_eq!(clean.corrected_bits, 0);
+
+            let decoded = decode(corrupted, DecodeOptions::default()).unwrap();
+            assert_eq!(decoded.payload, *payload);
+            assert_eq!(decoded.version, *version);
+            assert_eq!(decoded.schema_version, Some(*version));
+            assert!(!decoded.used_fallback());
+            let corrected_bits = u32::from(version.allowed_bit_flips());
+            assert_eq!(decoded.corrected_bits, corrected_bits);
+            assert_eq!(
+                decoded.candidates[0],
+                Candidate {
+                    version: *version,
+                    payload: payload.to_string(),
+                    corrected_bits,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn without_fallback_only_the_schema_bits_version_is_accepted() {
+        let (_, payload, packet, corrupted) = PYTHON_PACKETS[3];
+        let strict = DecodeOptions::new().with_fallback(false);
+        let decoded = decode(corrupted, strict).unwrap();
+        assert_eq!(decoded.payload, payload);
+        assert!(!decoded.used_fallback());
+
+        // The BCH_5 packet with its schema bits damaged into BCH_SUPER's.
+        let damaged = with_schema(packet, "0000");
+        let decoded = decode(&damaged, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.version, Version::Bch5);
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.schema_version, Some(Version::BchSuper));
+        assert!(decoded.used_fallback());
+        assert!(matches!(
+            decode(&damaged, strict),
+            Err(Error::CorruptWatermark)
+        ));
+    }
+
+    #[test]
+    fn undefined_schema_bits() {
+        let (_, payload, packet, _) = PYTHON_PACKETS[3];
+        let bch5 = DecodeOptions::new().with_allowed_versions([Version::Bch5]);
+        let damaged = with_schema(packet, "0101");
+
+        let decoded = decode(&damaged, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.schema_version, None);
+        assert_eq!(decoded.version, Version::Bch5);
+        assert_eq!(decoded.payload, payload);
+        assert!(decoded.used_fallback());
+        assert_eq!(decode(&damaged, bch5).unwrap().payload, payload);
+
+        for strict in [
+            DecodeOptions::new().with_fallback(false),
+            bch5.with_fallback(false),
+        ] {
+            assert!(matches!(
+                decode(&damaged, strict),
+                Err(Error::CorruptWatermark)
+            ));
+        }
+    }
+
+    #[test]
+    fn allowed_versions() {
+        let (_, payload, packet, corrupted) = PYTHON_PACKETS[3];
+        let bch5 = DecodeOptions::new().with_allowed_versions([Version::Bch5]);
+        assert_eq!(decode(corrupted, bch5).unwrap().payload, payload);
+
+        // Schema bits damaged into BCH_4's: allowing only BCH_5 still finds it, unless the schema
+        // bits must agree.
+        let damaged = with_schema(packet, "0010");
+        let decoded = decode(&damaged, bch5).unwrap();
+        assert_eq!(decoded.version, Version::Bch5);
+        assert!(decoded.used_fallback());
+        assert!(matches!(
+            decode(&damaged, bch5.with_fallback(false)),
+            Err(Error::CorruptWatermark)
+        ));
+
+        for others in [
+            DecodeOptions::new().with_allowed_versions([Version::BchSuper, Version::Bch4]),
+            DecodeOptions::new().with_allowed_versions([]),
+        ] {
+            assert!(matches!(
+                decode(packet, others),
+                Err(Error::CorruptWatermark)
+            ));
+        }
+
+        assert_eq!(
+            format!("{:?}", bch5.with_fallback(false)),
+            "DecodeOptions { allowed_versions: [Bch5], fallback: false, padding_check: false }"
+        );
+        assert_eq!(DecodeOptions::new(), DecodeOptions::default());
+    }
+
+    /// A clean BCH_5 packet from the Python reference encoder that also passes the BCH_3 check,
+    /// with a different payload: `(BCH_5 payload, packet, BCH_3 payload)`. Found by decoding 2000
+    /// random BCH_5 packets from the reference encoder under every version; about 9% of BCH_5
+    /// packets are ambiguous like this, almost all of them with BCH_3.
+    const AMBIGUOUS: (&str, &str, &str) = (
+        "1100011101011110010100100100010010111100000001111000001111001",
+        "1100011101011110010100100100010010111100000001111000001111001111001000010000001110111101100100110001",
+        "110001110101111011010010010001001011110000000111100000111100111100100001000",
+    );
+
+    #[test]
+    fn ambiguous_packet() {
+        let (payload, packet, bch3_payload) = AMBIGUOUS;
+        let encoded =
+            Bits::apply_error_correction_and_schema(payload.to_string(), Version::Bch5).unwrap();
+        assert_eq!(encoded.0, packet);
+
+        let decoded = decode(packet, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.version, Version::Bch5);
+        assert_eq!(decoded.payload, payload);
+        assert!(decoded.is_ambiguous());
+        assert_eq!(
+            decoded.candidates,
+            [
+                Candidate {
+                    version: Version::Bch5,
+                    payload: payload.to_string(),
+                    corrected_bits: 0,
+                },
+                Candidate {
+                    version: Version::Bch3,
+                    payload: bch3_payload.to_string(),
+                    corrected_bits: 3,
+                },
+            ]
+        );
+
+        // With the schema bits damaged into BCH_SUPER's or an undefined pattern, the fallback tries
+        // BCH_3 before BCH_5 and returns a payload that was never embedded.
+        for schema in ["0000", "0100"] {
+            let damaged = with_schema(packet, schema);
+            assert_eq!(Bits::new(damaged.clone()).unwrap().get_data(), bch3_payload);
+            let decoded = decode(&damaged, DecodeOptions::default()).unwrap();
+            assert_eq!(decoded.version, Version::Bch3);
+            assert_eq!(decoded.payload, bch3_payload);
+            assert!(decoded.used_fallback());
+            assert!(decoded.is_ambiguous());
+
+            let bch5 = DecodeOptions::new().with_allowed_versions([Version::Bch5]);
+            assert_eq!(decode(&damaged, bch5).unwrap().payload, payload);
+            assert!(matches!(
+                decode(&damaged, DecodeOptions::new().with_fallback(false)),
+                Err(Error::CorruptWatermark)
+            ));
+        }
+    }
+
+    /// Bits whose only error is in the zero padding of the payload, from the cross-language
+    /// conformance vectors (`pad_bit_correction`): `(version, bits, payload)`.
+    const PADDING_CORRECTIONS: &[(Version, &str, &str)] = &[
+        (
+            Version::Bch5,
+            "1110011100011110110110100100111001000000010110111000001101101010001100100010110001101001111101000001",
+            "1110011100011110110110100100111001000000010110111000001101101",
+        ),
+        (
+            Version::Bch4,
+            "1110111000100100011111000111111010110110100010100001100010101010010100011111101101100101101000100010",
+            "11101110001001000111110001111110101101101000101000011000101010100101",
+        ),
+        (
+            Version::Bch3,
+            "0001000011001111011001100110000100011010101101101101100010001010000001010101110101001111100010010011",
+            "000100001100111101100110011000010001101010110110110110001000101000000101010",
+        ),
+    ];
+
+    #[test]
+    fn padding_check() {
+        for (version, bits, payload) in PADDING_CORRECTIONS {
+            let decoded = decode(bits, DecodeOptions::default()).unwrap();
+            assert_eq!(decoded.version, *version);
+            assert_eq!(decoded.payload, *payload);
+            assert_eq!(decoded.corrected_bits, 1);
+            for options in [
+                DecodeOptions::new().with_padding_check(true),
+                DecodeOptions::strict(),
+            ] {
+                assert!(matches!(
+                    decode(bits, options),
+                    Err(Error::CorruptWatermark)
+                ));
+            }
+        }
+
+        // A watermark with no more bit flips than the capacity never needs a padding correction.
+        for (version, payload, packet, corrupted) in PYTHON_PACKETS {
+            for input in [packet, corrupted] {
+                let decoded = decode(input, DecodeOptions::strict()).unwrap();
+                assert_eq!(decoded.version, *version);
+                assert_eq!(decoded.payload, *payload);
             }
         }
     }
