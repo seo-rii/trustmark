@@ -115,6 +115,10 @@ In payload encoding, the version bits comprise two reserved (unused) bits, and t
 
 For more details and information on configuring the encoding mode in Python, see [Configuring TrustMark](python/CONFIG.md). 
 
+## Model files
+
+[`models/manifest.json`](models/manifest.json) lists every published model file with its model family, variant, digests and ONNX inputs and outputs, and states which encoders and decoders interoperate. See [`models/README.md`](models/README.md).
+
 ## Citation
 
 If you find this work useful, please give us a star ⭐ and cite the repository and/or TrustMark paper, preferrably as follows:

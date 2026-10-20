@@ -1,0 +1,1049 @@
+{
+  "manifest_version": 1,
+  "description": "Published TrustMark model artifacts, the model family and variant of each one, and which encoders and decoders interoperate. See models/README.md.",
+  "base_url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/",
+  "digests": {
+    "computed": "2026-10-20",
+    "method": "Each artifact was downloaded from its url (or read from repo_path) and size, md5 and sha256 were computed over the received bytes.",
+    "status": "unconfirmed: computed by a contributor, to be confirmed by the maintainers against the files they published"
+  },
+  "families": {
+    "trustmark": {
+      "summary": "The TrustMark models published by Adobe. python/ loads the PyTorch checkpoints; rust/, cpp/ and js/ load the ONNX exports of the same variants, and so does python-hailo/ for its 'cpu' (onnxruntime) backends.",
+      "name_source": "Name of the project, of the PyPI package built from python/ and of the trustmark-models/ CDN directory; the registered C2PA soft-binding algorithm ids also use the com.adobe.trustmark prefix.",
+      "references": ["README.md", "python/CONFIG.md", "https://arxiv.org/abs/2311.18297"]
+    },
+    "trustmark-hailo": {
+      "summary": "Hailo-8L NPU builds used by python-hailo/ when encoder_backend or decoder_backend is 'npu', and by its bounding-box detector. Quantized to INT8, except the P encoder which uses 16 bits.",
+      "name_source": "Name of the PyPI package built from python-hailo/.",
+      "references": ["python-hailo/README.md", "python-hailo/CONFIG.md"],
+      "notes": [
+        "python-hailo/CONFIG.md states that images encoded by the PyTorch port cannot be decoded by python-hailo/ and vice versa because its models are separately trained or quantized. This manifest records that as the status between the trustmark and trustmark-hailo families; it was not tested for lack of Hailo hardware.",
+        "The python-hailo/ 'cpu' backends are not part of this family: they load the trustmark-family encoder_{V}.onnx and decoder_{V}.onnx, whose md5 values python-hailo/trustmark_hailo/trustmark_hailo.py pins. With those backends python-hailo/ and python/ decoded each other's watermarks for B, C, P and Q (see compatibility.verification), contrary to the CONFIG.md statement above.",
+        "secret2image_{B,C,P,Q}.npz hold exactly the Gemm weights of the trustmark-family encoder_{V}.onnx, so the NPU encoders were compiled from those ONNX files; quantization changes the other weights."
+      ]
+    }
+  },
+  "variants": {
+    "Q": {
+      "summary": "Default. Good trade-off between robustness and imperceptibility; published with the 2023 paper.",
+      "decoder_backbone": "ResNet-50",
+      "typical_psnr_db": "43-45"
+    },
+    "B": {
+      "summary": "Very similar to Q; included mainly to reproduce the 2023 paper.",
+      "decoder_backbone": "ResNet-50",
+      "typical_psnr_db": "43-45"
+    },
+    "C": {
+      "summary": "Compact. Smaller decoder, lower visual quality.",
+      "decoder_backbone": "ResNet-18",
+      "typical_psnr_db": "38-39"
+    },
+    "P": {
+      "summary": "Perceptual. Highest visual quality, trained with a higher perceptual loss weight; always crops the center square.",
+      "decoder_backbone": "ResNet-50",
+      "typical_psnr_db": "48-50"
+    }
+  },
+  "wire_format": {
+    "summary": "All families and variants carry the same 100-bit packet; the decoder auto-detects the schema from the version bits.",
+    "packet_bits": 100,
+    "layout": "data bits, then BCH parity bits, then 4 version bits",
+    "version_bits": "The last 4 bits: 2 reserved bits written as 0, then the schema id as a 2-bit integer. Decoders read only the last 2 bits.",
+    "bch_polynomial": 137,
+    "schemas": [
+      {"id": 0, "name": "BCH_SUPER", "data_bits": 40, "ecc_bits": 56, "correctable_bit_flips": 8},
+      {"id": 1, "name": "BCH_5", "data_bits": 61, "ecc_bits": 35, "correctable_bit_flips": 5},
+      {"id": 2, "name": "BCH_4", "data_bits": 68, "ecc_bits": 28, "correctable_bit_flips": 4},
+      {"id": 3, "name": "BCH_3", "data_bits": 75, "ecc_bits": 21, "correctable_bit_flips": 3}
+    ],
+    "raw_mode": "python/ with use_ECC=False embeds 100 raw bits without parity or version bits.",
+    "references": ["README.md#data-schema", "python/CONFIG.md", "python/trustmark/datalayer.py"]
+  },
+  "c2pa_soft_binding": {
+    "assertion": "c2pa.soft-binding",
+    "value_format": "<schema id>*<data bits>, for example 1*0101... (c2pa/c2pa_watermark_example.py, js/tm_datalayer.js)",
+    "registry": "https://github.com/c2pa-org/softbinding-algorithm-list",
+    "registry_checked": {"date": "2026-10-20", "commit": "5d5f99f97049627758fa3214822140eaa992af11"},
+    "registered": [
+      {"model_family": "trustmark", "variant": "Q", "alg": "com.adobe.trustmark.Q", "registry_identifier": 4},
+      {"model_family": "trustmark", "variant": "C", "alg": "com.adobe.trustmark.C", "registry_identifier": 5},
+      {"model_family": "trustmark", "variant": "P", "alg": "com.adobe.trustmark.P", "registry_identifier": 13}
+    ],
+    "notes": [
+      "The registry has no entry for variant B.",
+      "Registry entries name a TrustMark variant, not a model family. This manifest assigns no algorithm id to trustmark-hailo."
+    ]
+  },
+  "preprocessing": {
+    "common": {
+      "color": "RGB",
+      "layout": "NCHW",
+      "dtype": "float32",
+      "value_range": [-1.0, 1.0],
+      "normalization": "pixel / 127.5 - 1 for 8-bit pixels",
+      "crop": "If the long side is more than twice the short side, use the centered square whose side is the short side, otherwise use the whole image. Variant P always uses the centered square.",
+      "resample": "bilinear",
+      "encoder_input_size": 256,
+      "encoder_output": "Watermarked image in [-1, 1]. Implementations take residual = output - input, resize the residual to the cropped region and add it to the original pixels.",
+      "bit_decision": "Packet bit i is 1 when decoder output i is positive. rust/, cpp/ and js/ also map an output of exactly 0 to 1."
+    },
+    "variants": {
+      "B": {
+        "crop_always_center_square": false,
+        "decoder_input_size": {"pytorch": 245, "onnx": 256},
+        "decoder_network_size": 224,
+        "strength_multiplier": 1.0
+      },
+      "C": {
+        "crop_always_center_square": false,
+        "decoder_input_size": {"pytorch": 245, "onnx": 256},
+        "decoder_network_size": 224,
+        "strength_multiplier": 1.0
+      },
+      "P": {
+        "crop_always_center_square": true,
+        "decoder_input_size": {"pytorch": 224, "onnx": 224},
+        "decoder_network_size": 224,
+        "strength_multiplier": 1.25
+      },
+      "Q": {
+        "crop_always_center_square": false,
+        "decoder_input_size": {"pytorch": 245, "onnx": 256},
+        "decoder_network_size": 224,
+        "strength_multiplier": 1.0
+      }
+    },
+    "decoder_internal_resize": "The decoder network runs at 224x224. SecretDecoder.forward (python/trustmark/unet.py) resizes larger inputs to 224x224 with bilinear interpolation (align_corners=False, no antialiasing); the B, C and Q ONNX decoders contain the same step as a Resize node (mode linear, half_pixel coordinates). python/ feeds 245x245 images to the PyTorch decoders while the ONNX decoders take 256x256 (cpp/README.md); this difference is intentional and recorded, not a defect of either file.",
+    "runtimes": {
+      "python": {"formats": ["pytorch-ckpt", "yaml"], "resample": "PIL Image.BILINEAR, which antialiases when downscaling"},
+      "rust": {"formats": ["onnx"], "resample": "fast_image_resize bilinear"},
+      "cpp": {"formats": ["onnx"], "resample": "OpenCV INTER_LINEAR"},
+      "js": {
+        "formats": ["onnx"],
+        "roles": ["decoder"],
+        "variants": ["P", "Q"],
+        "resample": "resizer.onnx",
+        "notes": "js/tm_watermark.js scales pixels to [0, 1] and passes the resizer output to the decoder without mapping it to [-1, 1]."
+      },
+      "python-hailo": {"formats": ["onnx", "hailo-hef", "npz"], "resample": "PIL Image.BILINEAR"}
+    }
+  },
+  "compatibility": {
+    "rule": "An encoder's output decodes only with a decoder of the same model_family and variant. Within the trustmark family the PyTorch checkpoint and the ONNX export of a variant are interchangeable, given the preprocessing above.",
+    "pairs": [
+      {
+        "encoder": {"model_family": "trustmark", "variant": "B"},
+        "decoder": {"model_family": "trustmark", "variant": "B"},
+        "status": "supported"
+      },
+      {
+        "encoder": {"model_family": "trustmark", "variant": "C"},
+        "decoder": {"model_family": "trustmark", "variant": "C"},
+        "status": "supported"
+      },
+      {
+        "encoder": {"model_family": "trustmark", "variant": "P"},
+        "decoder": {"model_family": "trustmark", "variant": "P"},
+        "status": "supported"
+      },
+      {
+        "encoder": {"model_family": "trustmark", "variant": "Q"},
+        "decoder": {"model_family": "trustmark", "variant": "Q"},
+        "status": "supported"
+      },
+      {
+        "encoder": {"model_family": "trustmark-hailo", "variant": "B"},
+        "decoder": {"model_family": "trustmark-hailo", "variant": "B"},
+        "status": "supported",
+        "source": "python-hailo/README.md"
+      },
+      {
+        "encoder": {"model_family": "trustmark-hailo", "variant": "C"},
+        "decoder": {"model_family": "trustmark-hailo", "variant": "C"},
+        "status": "supported",
+        "source": "python-hailo/README.md"
+      },
+      {
+        "encoder": {"model_family": "trustmark-hailo", "variant": "P"},
+        "decoder": {"model_family": "trustmark-hailo", "variant": "P"},
+        "status": "supported",
+        "source": "python-hailo/README.md"
+      },
+      {
+        "encoder": {"model_family": "trustmark-hailo", "variant": "Q"},
+        "decoder": {"model_family": "trustmark-hailo", "variant": "Q"},
+        "status": "supported",
+        "source": "python-hailo/README.md"
+      }
+    ],
+    "unsupported": [
+      {
+        "case": "Encoder and decoder of different variants, in any family",
+        "source": "python/CONFIG.md, python-hailo/CONFIG.md"
+      },
+      {
+        "case": "trustmark encoder with trustmark-hailo decoder, or the reverse",
+        "source": "python-hailo/CONFIG.md",
+        "verified": false
+      }
+    ],
+    "verification": [
+      {
+        "date": "2026-10-20",
+        "pairs": "trustmark B, C, P and Q",
+        "method": "BCH_5 payload embedded into images/ghost.png, images/ripley.jpg and images/ufo_240.jpg by python/ with the PyTorch encoder and, separately, with the encoder network replaced by encoder_{V}.onnx in onnxruntime; each result decoded by the PyTorch decoder (python/ preprocessing) and by decoder_{V}.onnx (ONNX input size, PIL bilinear resize).",
+        "result": "payload recovered in all 48 combinations"
+      },
+      {
+        "date": "2026-10-20",
+        "pairs": "trustmark B, C, P and Q, python-hailo/ with encoder_backend and decoder_backend 'cpu'",
+        "method": "python-hailo/ encoded images/ghost.png and images/ripley.jpg and python/ decoded them, and the reverse.",
+        "result": "payload recovered in all 16 combinations"
+      }
+    ]
+  },
+  "artifacts": {
+    "trustmark_B.yaml": {
+      "format": "yaml",
+      "model_family": "trustmark",
+      "variant": "B",
+      "role": "config",
+      "config_for": ["encoder", "decoder"],
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_B.yaml",
+      "size": 2009,
+      "md5": "fe40df84a7feeebfceb7a7678d7e6ec6",
+      "sha256": "43f37103f92efa8bd6b1c5902bb537cc12a981dc699fca19d9bb7de8c62d03d9",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"]
+    },
+    "encoder_B.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "B",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_B.ckpt",
+      "size": 17301658,
+      "md5": "e6ab35b3f2d02f37b418726a2dc0b9c9",
+      "sha256": "0bbdff257500879803ed0b931cfa3ba9819af971cb3384c2a369e20c57f92b49",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "bfloat16"
+    },
+    "decoder_B.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "B",
+      "role": "decoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_B.ckpt",
+      "size": 47649788,
+      "md5": "c4aaa4a86e551e6aac7f309331191971",
+      "sha256": "e3cab2862b7eeff22ddba0a25a230d6da79d9ecf8775e76340ac9ee0931152ed",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "bfloat16"
+    },
+    "trustmark_rm_B.yaml": {
+      "format": "yaml",
+      "model_family": "trustmark",
+      "variant": "B",
+      "role": "config",
+      "config_for": ["remover"],
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_rm_B.yaml",
+      "size": 1861,
+      "md5": "0952cd4de245c852840f22d096946db8",
+      "sha256": "1ac981cea7c2f9d1ca26038bfd6b6bdbefbf4ec6e962367670d30c36dc985f9a",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"]
+    },
+    "trustmark_rm_B.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "B",
+      "role": "remover",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_rm_B.ckpt",
+      "size": 77081406,
+      "md5": "eb4279e0301973112b021b1440363401",
+      "sha256": "835781bb5500a710cc63d59cc350a8f2028229a8fe4b719c6b79370d765cb41d",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "bfloat16"
+    },
+    "encoder_B.onnx": {
+      "format": "onnx",
+      "model_family": "trustmark",
+      "variant": "B",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_B.onnx",
+      "size": 17312208,
+      "md5": "4637c2eec9c44d334db833d08299bdce",
+      "sha256": "31e2fc73deba043de3b2ed0cbd4b0ec38fcc69dc112d3c4b6e52364a0921a65d",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["rust", "cpp", "python-hailo"],
+      "onnx": {
+        "opset": 17,
+        "ir_version": 8,
+        "producer": "pytorch 2.2.0",
+        "weights_dtype": "float16",
+        "compute_dtype": "float16",
+        "inputs": [
+          {
+            "name": "onnx::Concat_0",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "cover image, RGB, values in [-1, 1]"
+          },
+          {"name": "onnx::Gemm_1", "dtype": "float32", "shape": [1, 100], "semantics": "100-bit packet as 0.0/1.0"}
+        ],
+        "outputs": [
+          {
+            "name": "image",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "watermarked image, RGB, values in [-1, 1]"
+          }
+        ]
+      }
+    },
+    "decoder_B.onnx": {
+      "format": "onnx",
+      "model_family": "trustmark",
+      "variant": "B",
+      "role": "decoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_B.onnx",
+      "size": 47401222,
+      "md5": "5ff772e2486d286f32e21aced3694b60",
+      "sha256": "d0e25bb6925f1b92c321996cf4ec4961f38de711099b9a289000db4fcd51aa8d",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["rust", "cpp", "python-hailo"],
+      "onnx": {
+        "opset": 17,
+        "ir_version": 8,
+        "producer": "pytorch 2.2.0",
+        "weights_dtype": "float16",
+        "compute_dtype": "float16",
+        "inputs": [
+          {
+            "name": "image",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "image, RGB, values in [-1, 1]"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "output",
+            "dtype": "float32",
+            "shape": [1, 100],
+            "semantics": "100 logits; packet bit i is 1 when output i > 0"
+          }
+        ]
+      }
+    },
+    "trustmark_C.yaml": {
+      "format": "yaml",
+      "model_family": "trustmark",
+      "variant": "C",
+      "role": "config",
+      "config_for": ["encoder", "decoder"],
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_C.yaml",
+      "size": 2047,
+      "md5": "4ee4a79c091f9263c949bd0cb590eb74",
+      "sha256": "cf38887be05093c23c874ba999d38a70e1fbd2c67b18d388a64bc6446be661d2",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"]
+    },
+    "encoder_C.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "C",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_C.ckpt",
+      "size": 17301658,
+      "md5": "c22bd5f675ee2cf2a6b18f3c2cbcc507",
+      "sha256": "2eeeaf02178976f04d0996280466a22e53418fee8d7c063990b1a039aec0a50b",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "bfloat16"
+    },
+    "decoder_C.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "C",
+      "role": "decoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_C.ckpt",
+      "size": 22520762,
+      "md5": "ab3fa5678a86c006bb162e5cc90501d3",
+      "sha256": "ede8305d71b569a3a1c11cf51a76a7729a7ec2bc00e74b9a5d617458763b3a42",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "bfloat16"
+    },
+    "trustmark_rm_C.yaml": {
+      "format": "yaml",
+      "model_family": "trustmark",
+      "variant": "C",
+      "role": "config",
+      "config_for": ["remover"],
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_rm_C.yaml",
+      "size": 1658,
+      "md5": "8476bcd4092abf302272868f3b4c2e38",
+      "sha256": "d8ae92c8ad0135a5d085c295be8560fbb67af9b8f5ab46bbf25f4a1038a8626f",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"]
+    },
+    "trustmark_rm_C.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "C",
+      "role": "remover",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_rm_C.ckpt",
+      "size": 77081406,
+      "md5": "5ca3d651d9cde175433cebdf437e412f",
+      "sha256": "9ade304d865178f494c3b5328bf1e852725f97066f79b84266b34464b73bc0bb",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "bfloat16"
+    },
+    "encoder_C.onnx": {
+      "format": "onnx",
+      "model_family": "trustmark",
+      "variant": "C",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_C.onnx",
+      "size": 17312208,
+      "md5": "e3f9ad8784788ae208bb37a88c1fc50d",
+      "sha256": "b77ee90beba2c195abf3feefb08b355e9097aa5e94dec2b506a8b2dad9a2d0a0",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["rust", "cpp", "python-hailo"],
+      "onnx": {
+        "opset": 17,
+        "ir_version": 8,
+        "producer": "pytorch 2.2.0",
+        "weights_dtype": "float16",
+        "compute_dtype": "float16",
+        "inputs": [
+          {
+            "name": "onnx::Concat_0",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "cover image, RGB, values in [-1, 1]"
+          },
+          {"name": "onnx::Gemm_1", "dtype": "float32", "shape": [1, 100], "semantics": "100-bit packet as 0.0/1.0"}
+        ],
+        "outputs": [
+          {
+            "name": "image",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "watermarked image, RGB, values in [-1, 1]"
+          }
+        ]
+      }
+    },
+    "decoder_C.onnx": {
+      "format": "onnx",
+      "model_family": "trustmark",
+      "variant": "C",
+      "role": "decoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_C.onnx",
+      "size": 22457887,
+      "md5": "1a70390e044540de00af2671bc567faf",
+      "sha256": "3d92f4a278bcf87ac7dc40248c36ae664fe5fdedfd19ca265f7ca730b271100a",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["rust", "cpp", "python-hailo"],
+      "onnx": {
+        "opset": 17,
+        "ir_version": 8,
+        "producer": "pytorch 2.2.0",
+        "weights_dtype": "float16",
+        "compute_dtype": "float16",
+        "inputs": [
+          {
+            "name": "image",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "image, RGB, values in [-1, 1]"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "output",
+            "dtype": "float32",
+            "shape": [1, 100],
+            "semantics": "100 logits; packet bit i is 1 when output i > 0"
+          }
+        ]
+      }
+    },
+    "trustmark_P.yaml": {
+      "format": "yaml",
+      "model_family": "trustmark",
+      "variant": "P",
+      "role": "config",
+      "config_for": ["encoder", "decoder"],
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_P.yaml",
+      "size": 2009,
+      "md5": "fe40df84a7feeebfceb7a7678d7e6ec6",
+      "sha256": "43f37103f92efa8bd6b1c5902bb537cc12a981dc699fca19d9bb7de8c62d03d9",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"]
+    },
+    "encoder_P.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "P",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_P.ckpt",
+      "size": 17301306,
+      "md5": "0a18f6de6d57c6ef7dda30ce6154a775",
+      "sha256": "659d427f72d16eea4e8fbda175ae72e3a78830dc6cf44b63642a5a4b28a2b4e2",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "float16"
+    },
+    "decoder_P.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "P",
+      "role": "decoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_P.ckpt",
+      "size": 47647180,
+      "md5": "9450972bc0c3c217cb7b8220dd2f7a3c",
+      "sha256": "f5f1d570c889c5908c6e4a28c07dc90cf33990ebaf24037254ebe0b8849b1bdc",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "float16"
+    },
+    "trustmark_rm_P.yaml": {
+      "format": "yaml",
+      "model_family": "trustmark",
+      "variant": "P",
+      "role": "config",
+      "config_for": ["remover"],
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_rm_P.yaml",
+      "size": 1667,
+      "md5": "654cabd3ac8339397fbc611ca7464780",
+      "sha256": "0fd5b7a36eadb4bb4bc7cc28fa099f83605db92e9e98b4e67f932f05f937df5a",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"]
+    },
+    "trustmark_rm_P.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "P",
+      "role": "remover",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_rm_P.ckpt",
+      "size": 77069622,
+      "md5": "8b8f4715ea474327921ee9d0f46d2c3f",
+      "sha256": "35524f58b33b6977f0c537b4e494327f65fee386c53cf87e7aaa2ebbfd1c7909",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "float16"
+    },
+    "trustmark_bbox_P.yaml": {
+      "format": "yaml",
+      "model_family": "trustmark",
+      "variant": "P",
+      "role": "config",
+      "config_for": ["detector"],
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_bbox_P.yaml",
+      "size": 2154,
+      "md5": "749b0d62106f8f6648e6f781c3143105",
+      "sha256": "ece16973942447c68c0ac418ba87147f80c0946d5cd794b5451a95d9d848da0b",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"]
+    },
+    "trustmark_bbox_P.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "P",
+      "role": "detector",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_bbox_P.ckpt",
+      "size": 82933264,
+      "md5": "65863e44eaccb58b147f119371723200",
+      "sha256": "6bca434ba6b624330299e56842471349a8fc98bf8ae845da9bc0a77ddf59900a",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "float16"
+    },
+    "encoder_P.onnx": {
+      "format": "onnx",
+      "model_family": "trustmark",
+      "variant": "P",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_P.onnx",
+      "size": 17312208,
+      "md5": "4cb6dfe2ec5e97e7ced942c7c6239e6f",
+      "sha256": "053441c9c9f05fc158ccba71c610d9d58fcd2c82d1912bf0ffcee988cf2f74c8",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["rust", "cpp", "python-hailo"],
+      "onnx": {
+        "opset": 17,
+        "ir_version": 8,
+        "producer": "pytorch 2.5.1",
+        "weights_dtype": "float16",
+        "compute_dtype": "float16",
+        "inputs": [
+          {
+            "name": "onnx::Concat_0",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "cover image, RGB, values in [-1, 1]"
+          },
+          {"name": "onnx::Gemm_1", "dtype": "float32", "shape": [1, 100], "semantics": "100-bit packet as 0.0/1.0"}
+        ],
+        "outputs": [
+          {
+            "name": "image",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "watermarked image, RGB, values in [-1, 1]"
+          }
+        ]
+      }
+    },
+    "decoder_P.onnx": {
+      "format": "onnx",
+      "model_family": "trustmark",
+      "variant": "P",
+      "role": "decoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_P.onnx",
+      "size": 47400467,
+      "md5": "2c77408a11bf4f22bb3dcf9e5706dfdd",
+      "sha256": "be6d7c33f8a7b376f179e75f3f7c58ff816a9ac7bb6d37fd0a729a635f624c35",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["rust", "cpp", "python-hailo", "js"],
+      "onnx": {
+        "opset": 17,
+        "ir_version": 8,
+        "producer": "pytorch 2.5.1",
+        "weights_dtype": "float16",
+        "compute_dtype": "float16",
+        "inputs": [
+          {
+            "name": "image",
+            "dtype": "float32",
+            "shape": [1, 3, 224, 224],
+            "semantics": "image, RGB, values in [-1, 1]"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "output",
+            "dtype": "float32",
+            "shape": [1, 100],
+            "semantics": "100 logits; packet bit i is 1 when output i > 0"
+          }
+        ]
+      }
+    },
+    "trustmark_Q.yaml": {
+      "format": "yaml",
+      "model_family": "trustmark",
+      "variant": "Q",
+      "role": "config",
+      "config_for": ["encoder", "decoder"],
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_Q.yaml",
+      "size": 2009,
+      "md5": "fe40df84a7feeebfceb7a7678d7e6ec6",
+      "sha256": "43f37103f92efa8bd6b1c5902bb537cc12a981dc699fca19d9bb7de8c62d03d9",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"]
+    },
+    "encoder_Q.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "Q",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_Q.ckpt",
+      "size": 17302074,
+      "md5": "700328b8754db934b2f6cb5e5185d81f",
+      "sha256": "dc382c3f6b4fd568b27d6fbb763d6ffc2d2587126d84afe9d5ee95b4c5d99826",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "float16"
+    },
+    "decoder_Q.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "Q",
+      "role": "decoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_Q.ckpt",
+      "size": 47652460,
+      "md5": "4ced90e9cfe13e3295ad082887fe9187",
+      "sha256": "e3d9cea5406a26590735719f8f15cb10802b11852ae69047eaf4cf17214df781",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "float16"
+    },
+    "trustmark_rm_Q.yaml": {
+      "format": "yaml",
+      "model_family": "trustmark",
+      "variant": "Q",
+      "role": "config",
+      "config_for": ["remover"],
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_rm_Q.yaml",
+      "size": 1658,
+      "md5": "8476bcd4092abf302272868f3b4c2e38",
+      "sha256": "d8ae92c8ad0135a5d085c295be8560fbb67af9b8f5ab46bbf25f4a1038a8626f",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"]
+    },
+    "trustmark_rm_Q.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "Q",
+      "role": "remover",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_rm_Q.ckpt",
+      "size": 77081406,
+      "md5": "760337a5596e665aed2ab5c49aa5284f",
+      "sha256": "cb23dc28b69104ae551286f63da6e965d269f715a87748e3ae7fe0d790f7dc9a",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "bfloat16"
+    },
+    "trustmark_bbox_Q.yaml": {
+      "format": "yaml",
+      "model_family": "trustmark",
+      "variant": "Q",
+      "role": "config",
+      "config_for": ["detector"],
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_bbox_Q.yaml",
+      "size": 2154,
+      "md5": "749b0d62106f8f6648e6f781c3143105",
+      "sha256": "ece16973942447c68c0ac418ba87147f80c0946d5cd794b5451a95d9d848da0b",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"]
+    },
+    "trustmark_bbox_Q.ckpt": {
+      "format": "pytorch-ckpt",
+      "model_family": "trustmark",
+      "variant": "Q",
+      "role": "detector",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/trustmark_bbox_Q.ckpt",
+      "size": 82933264,
+      "md5": "9d15428a33e15140ea16aa378416d304",
+      "sha256": "7e1da5667a4da070573d71bbf5a03d586f8836397bbcdf2c2044865ec37df0a5",
+      "md5_pinned_in": ["python/trustmark/trustmark.py"],
+      "used_by": ["python"],
+      "weights_dtype": "float16"
+    },
+    "encoder_Q.onnx": {
+      "format": "onnx",
+      "model_family": "trustmark",
+      "variant": "Q",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_Q.onnx",
+      "size": 17312208,
+      "md5": "d6fa92d4b4fe8d67ad196b2d21320955",
+      "sha256": "19b3d1b25836130ffd78775a8f61539f993375d1823ef0e59ba5b8dffb4f892d",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["rust", "cpp", "python-hailo"],
+      "onnx": {
+        "opset": 17,
+        "ir_version": 8,
+        "producer": "pytorch 2.2.2",
+        "weights_dtype": "float16",
+        "compute_dtype": "float16",
+        "inputs": [
+          {
+            "name": "onnx::Concat_0",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "cover image, RGB, values in [-1, 1]"
+          },
+          {"name": "onnx::Gemm_1", "dtype": "float32", "shape": [1, 100], "semantics": "100-bit packet as 0.0/1.0"}
+        ],
+        "outputs": [
+          {
+            "name": "image",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "watermarked image, RGB, values in [-1, 1]"
+          }
+        ]
+      }
+    },
+    "decoder_Q.onnx": {
+      "format": "onnx",
+      "model_family": "trustmark",
+      "variant": "Q",
+      "role": "decoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_Q.onnx",
+      "size": 47401222,
+      "md5": "90427159004ddbf5128271ba0684cf42",
+      "sha256": "ee3268f057c9dabef680e169302f5973d0589feea86189ed229a896cc3aa88df",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["rust", "cpp", "python-hailo", "js"],
+      "onnx": {
+        "opset": 17,
+        "ir_version": 8,
+        "producer": "pytorch 2.2.2",
+        "weights_dtype": "float16",
+        "compute_dtype": "float16",
+        "inputs": [
+          {
+            "name": "image",
+            "dtype": "float32",
+            "shape": [1, 3, 256, 256],
+            "semantics": "image, RGB, values in [-1, 1]"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "output",
+            "dtype": "float32",
+            "shape": [1, 100],
+            "semantics": "100 logits; packet bit i is 1 when output i > 0"
+          }
+        ]
+      }
+    },
+    "resizer.onnx": {
+      "format": "onnx",
+      "model_family": null,
+      "variant": null,
+      "role": "resizer",
+      "notes": "Not a watermark model and not tied to a family or variant: an antialiased bicubic Resize (half_pixel) followed by Clip to [0, 1].",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/resizer.onnx",
+      "size": 454,
+      "md5": "9b655ebda1199c946fd74a2109e89ad1",
+      "sha256": "e7d6014def382e20d3748fc793761bfddce62578a5905fa6ef3d348c69a787c3",
+      "used_by": ["js"],
+      "onnx": {
+        "opset": 19,
+        "ir_version": 10,
+        "producer": "resize_model",
+        "weights_dtype": null,
+        "compute_dtype": "float32",
+        "inputs": [
+          {
+            "name": "X",
+            "dtype": "float32",
+            "shape": [1, 3, "height", "width"],
+            "semantics": "image, RGB, values in [0, 1], any size"
+          },
+          {"name": "scales", "dtype": "float32", "shape": [4], "semantics": "Resize scales [1, 1, scale_h, scale_w]"},
+          {"name": "target_size", "dtype": "int64", "shape": [1], "semantics": "not used by the graph"}
+        ],
+        "outputs": [
+          {
+            "name": "Y",
+            "dtype": "float32",
+            "shape": [1, 3, "new_height", "new_width"],
+            "semantics": "resized image clipped to [0, 1]"
+          }
+        ]
+      }
+    },
+    "encoder_B.hef": {
+      "format": "hailo-hef",
+      "model_family": "trustmark-hailo",
+      "variant": "B",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_B.hef",
+      "size": 14920732,
+      "md5": "0214c153ed48abb88aead8d18724f9f0",
+      "sha256": "7087e4f13f93e47a3ab16c25c1e0536141aa2bebed80b7dddb8c6170cb9d198f",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "secret2image_B.npz": {
+      "format": "npz",
+      "model_family": "trustmark-hailo",
+      "variant": "B",
+      "role": "encoder",
+      "part": "Secret2Image Linear layer, run on the CPU",
+      "repo_path": "python-hailo/trustmark_hailo/models/secret2image_B.npz",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/secret2image_B.npz",
+      "size": 311068,
+      "md5": "dab5a91b53bc4124db8550309dc4a295",
+      "sha256": "5278941d18bcc80741e92181026c1c1ae6c35026d63e798041eac6109cd99200",
+      "used_by": ["python-hailo"]
+    },
+    "decoder_B.hef": {
+      "format": "hailo-hef",
+      "model_family": "trustmark-hailo",
+      "variant": "B",
+      "role": "decoder",
+      "download_status": "not downloaded: the CDN answered HTTP 503 on every attempt on 2026-10-20; md5 copied from md5_pinned_in, size and sha256 unknown",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_B.hef",
+      "size": null,
+      "md5": "46bb169414e4f473c5d2b5ecdabdbb4c",
+      "sha256": null,
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "encoder_C.hef": {
+      "format": "hailo-hef",
+      "model_family": "trustmark-hailo",
+      "variant": "C",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_C.hef",
+      "size": 14733063,
+      "md5": "6fde6c40a0357f9db72d347a6cf45681",
+      "sha256": "54a2ec9911001d5e7d196534998aae8707910f887bbb4562209acc35814d28d8",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "secret2image_C.npz": {
+      "format": "npz",
+      "model_family": "trustmark-hailo",
+      "variant": "C",
+      "role": "encoder",
+      "part": "Secret2Image Linear layer, run on the CPU",
+      "repo_path": "python-hailo/trustmark_hailo/models/secret2image_C.npz",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/secret2image_C.npz",
+      "size": 311068,
+      "md5": "c3349b7c85eae6995675ec3fb69dadc8",
+      "sha256": "f151ef39270ed6cf7e336413ca2d5b986831fcf7cfce24e7b97b3cab67519bd1",
+      "used_by": ["python-hailo"]
+    },
+    "decoder_C.hef": {
+      "format": "hailo-hef",
+      "model_family": "trustmark-hailo",
+      "variant": "C",
+      "role": "decoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_C.hef",
+      "size": 18448026,
+      "md5": "5336b95d42c59af6982311e790de57be",
+      "sha256": "0f21c4202f39ad6769351c67e3a60c2b156da6e232af6ef4109ec0f8abd4ac2e",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "encoder_P.hef": {
+      "format": "hailo-hef",
+      "model_family": "trustmark-hailo",
+      "variant": "P",
+      "role": "encoder",
+      "download_status": "not downloaded: the CDN answered HTTP 503 on every attempt on 2026-10-20; md5 copied from md5_pinned_in, size and sha256 unknown",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_P.hef",
+      "size": null,
+      "md5": "447bbee2fc109d97c00be65168bae581",
+      "sha256": null,
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "secret2image_P.npz": {
+      "format": "npz",
+      "model_family": "trustmark-hailo",
+      "variant": "P",
+      "role": "encoder",
+      "part": "Secret2Image Linear layer, run on the CPU",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/secret2image_P.npz",
+      "size": 311068,
+      "md5": "1587de1bc5bec54c97edf0152c0699ec",
+      "sha256": "ab71c4d3b5e004cc700e09055bb175951ee19c98f7c1f8252bbbf1b7d110af9a",
+      "used_by": ["python-hailo"]
+    },
+    "decoder_P.hef": {
+      "format": "hailo-hef",
+      "model_family": "trustmark-hailo",
+      "variant": "P",
+      "role": "decoder",
+      "download_status": "not downloaded: the CDN answered HTTP 503 on every attempt on 2026-10-20; md5 copied from md5_pinned_in, size and sha256 unknown",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_P.hef",
+      "size": null,
+      "md5": "458950a851cf9c8a604f78b4d170c8b1",
+      "sha256": null,
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "bbox_trunk_P.hef": {
+      "format": "hailo-hef",
+      "model_family": "trustmark-hailo",
+      "variant": "P",
+      "role": "detector",
+      "part": "backbone and region proposal network",
+      "download_status": "not downloaded: the CDN answered HTTP 503 on every attempt on 2026-10-20; md5 copied from md5_pinned_in, size and sha256 unknown",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/bbox_trunk_P.hef",
+      "size": null,
+      "md5": "84b2b73550390c12a40a06fa0cd5327a",
+      "sha256": null,
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "box_head_P.npz": {
+      "format": "npz",
+      "model_family": "trustmark-hailo",
+      "variant": "P",
+      "role": "detector",
+      "part": "box head (CPU-side)",
+      "download_status": "not downloaded: the CDN answered HTTP 503 on every attempt on 2026-10-20; md5 copied from md5_pinned_in, size and sha256 unknown",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/box_head_P.npz",
+      "size": null,
+      "md5": "8d8619052367bfb2f88bedaef8684572",
+      "sha256": null,
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "encoder_Q.hef": {
+      "format": "hailo-hef",
+      "model_family": "trustmark-hailo",
+      "variant": "Q",
+      "role": "encoder",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/encoder_Q.hef",
+      "size": 15691200,
+      "md5": "32bf3832f5cf3a4cc7a1a89e9dadf3e5",
+      "sha256": "a1cecb769ab36b5eb7f33c7e693d9e7bea8ab7d92167e5ab8af3a9b44aabc0d1",
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "secret2image_Q.npz": {
+      "format": "npz",
+      "model_family": "trustmark-hailo",
+      "variant": "Q",
+      "role": "encoder",
+      "part": "Secret2Image Linear layer, run on the CPU",
+      "repo_path": "python-hailo/trustmark_hailo/models/secret2image_Q.npz",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/secret2image_Q.npz",
+      "size": 311068,
+      "md5": "b89df4efe87e622e6326cb996ade759d",
+      "sha256": "aeaeb27cc987f0c8b920a3b8b53be1dbd7737c158cd0f0cc77c94bba359c66cd",
+      "used_by": ["python-hailo"]
+    },
+    "decoder_Q.hef": {
+      "format": "hailo-hef",
+      "model_family": "trustmark-hailo",
+      "variant": "Q",
+      "role": "decoder",
+      "download_status": "not downloaded: the CDN answered HTTP 503 on every attempt on 2026-10-20; md5 copied from md5_pinned_in, size and sha256 unknown",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/decoder_Q.hef",
+      "size": null,
+      "md5": "b3fbe8502e5575be64ef991c34409c1a",
+      "sha256": null,
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "bbox_trunk_Q.hef": {
+      "format": "hailo-hef",
+      "model_family": "trustmark-hailo",
+      "variant": "Q",
+      "role": "detector",
+      "part": "backbone and region proposal network",
+      "download_status": "not downloaded: the CDN answered HTTP 503 on every attempt on 2026-10-20; md5 copied from md5_pinned_in, size and sha256 unknown",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/bbox_trunk_Q.hef",
+      "size": null,
+      "md5": "2797850f2bd9a743bebf2695d0aad3ff",
+      "sha256": null,
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    },
+    "box_head_Q.npz": {
+      "format": "npz",
+      "model_family": "trustmark-hailo",
+      "variant": "Q",
+      "role": "detector",
+      "part": "box head (CPU-side)",
+      "download_status": "not downloaded: the CDN answered HTTP 503 on every attempt on 2026-10-20; md5 copied from md5_pinned_in, size and sha256 unknown",
+      "url": "https://cai-watermark.adobe.net/watermarking/trustmark-models/box_head_Q.npz",
+      "size": null,
+      "md5": "b041ad168a43938e1f6547e075576627",
+      "sha256": null,
+      "md5_pinned_in": ["python-hailo/trustmark_hailo/trustmark_hailo.py"],
+      "used_by": ["python-hailo"]
+    }
+  }
+}
