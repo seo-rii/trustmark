@@ -40,10 +40,11 @@ g++ -std=c++17 -Icpp/src cpp/tests/conformance.cpp cpp/src/bch.cpp -o conformanc
 cargo test --manifest-path rust/Cargo.toml --lib conformance_tests
 ```
 
-The C++ test is also registered with CTest (`trustmark-conformance`). The Rust test
-reads `packets.tsv` with `include_str!` from outside the crate, so it builds only in a
-repository checkout. It is compiled only for tests, so it doesn't affect the published
-package.
+The C++ test is also registered with CTest (`trustmark-conformance`). The `Conformance`
+workflow runs the Python, JavaScript and C++ tests and checks that the files are up to
+date. Rust CI runs the Rust test. The Rust test reads `packets.tsv` with `include_str!`
+from outside the crate, so it builds only in a repository checkout. It is compiled only
+for tests, so it doesn't affect the published package.
 
 ## Format
 
