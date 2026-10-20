@@ -82,6 +82,12 @@ package directory. Three separate models exist; not all are needed for every use
 | Remover | `loadRemover=True` (default) | `remove_watermark` | large |
 | BBox detector | `loadBBoxDetector=False` (default) | `decode(..., DETECTFIRST=True)` | large |
 
+If the encoder or decoder files cannot be fetched, the constructor raises
+`ModelNotLoadedError` (`from trustmark import ModelNotLoadedError`, a `RuntimeError`
+subclass) naming the model and files, with the download error as its cause. A failed
+remover or bbox detector download only prints an error at construction; calling
+`remove_watermark` or `localize` afterwards raises `ModelNotLoadedError`.
+
 ### Downloading models manually
 
 If automatic download fails (no network access at runtime, corporate proxy, air-gapped

@@ -155,12 +155,12 @@ class DataLayer(object):
 
     def decode_text(self, data: np.array):
         assert len(data.shape)==2
-        return [self._decode_text(d) for d in data]
+        return [self._decode_text(d, 'text') for d in data]
 
 
     def decode_binary(self, data: np.array):
         assert len(data.shape)==2
-        return [self._decode_text(d) for d in data]
+        return [self._decode_text(d, 'binary') for d in data]
 
     
     def _decode_text(self, packet: np.array, MODE):

@@ -4,4 +4,4 @@ from __future__ import print_function
 
 import numpy as np
 
-from .trustmark import TrustMark
+from .trustmark import TrustMark, ModelNotLoadedError

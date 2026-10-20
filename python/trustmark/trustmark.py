@@ -70,6 +70,9 @@ CONCENTRATE_WM_REGION = 1.0
 ASPECT_RATIO_LIM = 2.0
 FEATHERING_RESIDUAL=0.01
 
+class ModelNotLoadedError(RuntimeError):
+    """Raised when a model needed by an operation could not be or was not loaded."""
+
 class TrustMark():
 
     class Encoding:
@@ -127,9 +130,15 @@ class TrustMark():
         self.removal = None
         self.detector = None
         if loadRemover:
-          self.removal = self.load_model(locations['config-rm'], locations['remover'], self.device, secret_len, part='remover')
+          try:
+            self.removal = self.load_model(locations['config-rm'], locations['remover'], self.device, secret_len, part='remover')
+          except ModelNotLoadedError as e:
+            print(e)
         if loadBBoxDetector:
-          self.detector = self.load_model(locations['config-detector'], locations['detector'], self.device, secret_len, part='detector')
+          try:
+            self.detector = self.load_model(locations['config-detector'], locations['detector'], self.device, secret_len, part='detector')
+          except ModelNotLoadedError as e:
+            print(e)
 
 
     def schemaCapacity(self):
@@ -157,8 +166,7 @@ class TrustMark():
             self.check_and_download(config_path)
             self.check_and_download(weight_path)
         except Exception as e:
-            print(f'Error downloading model file. {config_path} {weight_path}'+str(e))
-            return None
+            raise ModelNotLoadedError(f'Could not load {part} model. Error downloading model file. {config_path} {weight_path} {e}') from e
                    
         config = OmegaConf.load(config_path).model
         if part == 'encoder':
@@ -350,8 +358,8 @@ class TrustMark():
     def localize(self, in_stego_image, return_all: bool = False):
 
         if self.detector is None:
-            raise RuntimeError("BBox detector model is not loaded. "
-                               "Initialize TrustMark passing construtor loadBBoxDetector=True.")
+            raise ModelNotLoadedError("BBox detector model is not loaded. "
+                                      "Initialize TrustMark passing construtor loadBBoxDetector=True.")
 
         max_edge = self.model_resolution_max_detect
         w, h = in_stego_image.size
