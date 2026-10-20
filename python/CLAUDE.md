@@ -38,10 +38,11 @@ wrong results — no error is raised.
 Two modes are available:
 
 - `MODE='binary'` — payload is a bit string (`'0'` and `'1'` characters) of exactly
-  `schemaCapacity()` bits.
+  `schemaCapacity()` bits. Shorter payloads are zero-padded (and decode with the padding);
+  longer payloads or other characters raise `ValueError`.
 - `MODE='text'` — payload is a 7-bit ASCII string. Each character occupies 7 bits, so
-  the usable capacity is `schemaCapacity() // 7` characters. Non-ASCII (Unicode, bytes)
-  is not supported in this mode.
+  the usable capacity is `schemaCapacity() // 7` characters. Longer text or non-ASCII
+  (Unicode) characters raise `ValueError`.
 
 The default is `MODE='text'`. When working with raw bits or arbitrary binary data always
 pass `MODE='binary'` explicitly on both calls.
