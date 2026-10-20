@@ -33,10 +33,12 @@ def embed_watermark(img_in, img_out, watermarkID, tm):
    not_none_params = {k:v for k, v in params.items() if v is not None}
    encoded.save(img_out, **not_none_params)
 
-def build_manifest(watermarkID, img_in):
+def build_manifest(watermarkID, img_in, tm):
 
+       # the soft binding names the TrustMark variant and the encoding (data schema) that were used;
+       # C2PA lists com.adobe.trustmark.Q, .C and .P in its soft binding algorithm list
        assertions=[]
-       assertions.append(build_softbinding('com.adobe.trustmark.Q',str(TM_SCHEMA_CODE)+"*"+watermarkID))
+       assertions.append(build_softbinding('com.adobe.trustmark.'+tm.model_type,str(tm.enctyp)+"*"+watermarkID))
        actions=[]
        act=dict()
        act['action']='c2pa.watermarked'
@@ -104,7 +106,7 @@ def main() :
    embed_watermark(img_in, img_out, id, tm)
 
    # Build manifest
-   mf=build_manifest(id, img_in)
+   mf=build_manifest(id, img_in, tm)
    mf=manifest_add_creator(mf,"Walter Mark")
    mf=manifest_add_signing(mf)
 
@@ -121,13 +123,13 @@ def main() :
    wm_id, wm_present, wm_schema = tm.decode(stego, 'binary')
    if wm_present:
       print('Watermark detected in signed image')
-      if wm_id==id:
+      if wm_id==id and wm_schema==tm.enctyp:
          print('Watermark is correct')
          print(id)
       else:
          print('Watermark does not match!')
-         print(id)
-         print(wm_id)
+         print('expected schema %d: %s' % (tm.enctyp, id))
+         print('decoded schema %d: %s' % (wm_schema, wm_id))
    else:
        print('No watermark detected!')   
 
