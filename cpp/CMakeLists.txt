@@ -29,6 +29,13 @@ if(BUILD_TESTING)
         target_compile_options(trustmark-bch-test PRIVATE -UNDEBUG)
     endif()
     add_test(NAME trustmark-bch COMMAND trustmark-bch-test)
+
+    # Shared packet vectors; see tests/vectors/README.md at the repository root.
+    add_executable(trustmark-conformance-test tests/conformance.cpp src/bch.cpp)
+    target_compile_features(trustmark-conformance-test PRIVATE cxx_std_17)
+    target_include_directories(trustmark-conformance-test PRIVATE src)
+    add_test(NAME trustmark-conformance
+             COMMAND trustmark-conformance-test "${CMAKE_CURRENT_SOURCE_DIR}/../tests/vectors/packets.tsv")
 endif()
 
 if(UNIX)

@@ -13,6 +13,8 @@ use ort::value::{TensorValueType, Value};
 const VERSION_BITS: u16 = 4;
 
 mod bch;
+#[cfg(test)]
+mod conformance_tests;
 
 #[derive(Debug)]
 pub(super) struct Bits(String);
