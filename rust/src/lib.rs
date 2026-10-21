@@ -44,6 +44,7 @@
 use std::{path::Path, sync::Mutex};
 
 use image::{DynamicImage, GenericImageView as _};
+use ndarray::ArrayD;
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
     value::{TensorValueType, Value},
@@ -88,7 +89,7 @@ impl From<bits::Error> for Error {
     }
 }
 
-pub use bits::Version;
+pub use bits::{Candidate, DecodeOptions, Decoded, Version};
 pub use model::Variant;
 
 impl Trustmark {
@@ -171,7 +172,57 @@ impl Trustmark {
     }
 
     /// Decode a watermark from an image.
+    ///
+    /// This tries the version named by the watermark's schema bits first and then every other
+    /// version, and returns the payload of the first one that passes the BCH check without a
+    /// correction in the zero padding of the payload. Use
+    /// [`decode_with`](Self::decode_with) to restrict the accepted versions or to see how the
+    /// watermark was decoded. Passing the BCH check is not proof of provenance; see
+    /// [`DecodeOptions`].
     pub fn decode(&self, img: DynamicImage) -> Result<String, Error> {
+        let watermark: Bits = self.run_decoder(img)?.try_into()?;
+        Ok(watermark.get_data())
+    }
+
+    /// Decode a watermark from an image under `options`, reporting how it was decoded.
+    ///
+    /// With [`DecodeOptions::default()`] this accepts the same payload as
+    /// [`decode`](Self::decode). The result also reports the version, the version named by the
+    /// schema bits, the number of corrected bit flips and every version under which the bits pass
+    /// the BCH check, so callers can reject watermarks that were only found by falling back from
+    /// the schema bits or that are ambiguous. A watermark that the options do not accept is
+    /// [`Error::CorruptWatermark`].
+    ///
+    /// ```rust
+    /// use trustmark::{DecodeOptions, Trustmark, Variant, Version};
+    ///
+    /// # fn main() -> Result<(), trustmark::Error> {
+    /// let tm = Trustmark::new("./models", Variant::Q, Version::Bch5)?;
+    /// let input = image::open("../images/ghost.png").unwrap();
+    /// let watermarked = tm.encode("0010101".to_owned(), input, 0.95)?;
+    ///
+    /// // Only accept BCH_5, only when the schema bits name it, and without padding corrections.
+    /// let options = DecodeOptions::strict().with_allowed_versions([Version::Bch5]);
+    /// let decoded = tm.decode_with(watermarked, &options)?;
+    /// assert_eq!(decoded.version, Version::Bch5);
+    /// assert!(decoded.payload.starts_with("0010101"));
+    /// if decoded.is_ambiguous() {
+    ///     // The bits also pass the BCH check as another version, listed in `decoded.candidates`.
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn decode_with(
+        &self,
+        img: DynamicImage,
+        options: &DecodeOptions,
+    ) -> Result<Decoded, Error> {
+        let bits = bits::bitstring(self.run_decoder(img)?)?;
+        Ok(Bits::decode_with(&bits, options)?)
+    }
+
+    /// Run the decoder model on an image and return its raw output.
+    fn run_decoder(&self, img: DynamicImage) -> Result<ArrayD<f32>, Error> {
         // P variant has a smaller decode size
         let decode_size = if self.variant == Variant::P { 224 } else { 256 };
 
@@ -187,14 +238,45 @@ impl Trustmark {
             ])?;
             outputs["output"].try_extract_array::<f32>()?.to_owned()
         };
-        let watermark: Bits = watermark.try_into()?;
-        Ok(watermark.get_data())
+        Ok(watermark)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_with_reports_how_a_roundtrip_decoded() {
+        let tm = Trustmark::new("./models", Variant::Q, Version::Bch5).unwrap();
+        let input = image::open("../images/ghost.png").unwrap();
+        let watermark = "1011011110011000111111000000011111011111011100000110110110111".to_owned();
+        let encoded = tm.encode(watermark.clone(), input, 0.95).unwrap();
+        let encoded = DynamicImage::ImageRgba8(encoded.to_rgba8());
+
+        let strict = DecodeOptions::strict().with_allowed_versions([Version::Bch5]);
+        let decoded = tm.decode_with(encoded.clone(), &strict).unwrap();
+        assert_eq!(decoded.payload, watermark);
+        assert_eq!(decoded.version, Version::Bch5);
+        assert_eq!(decoded.schema_version, Some(Version::Bch5));
+        assert!(!decoded.used_fallback());
+        assert!(decoded.corrected_bits <= 5);
+        assert_eq!(decoded.candidates[0].version, Version::Bch5);
+        let default = tm
+            .decode_with(encoded.clone(), &DecodeOptions::default())
+            .unwrap();
+        assert_eq!(
+            (default.version, default.payload, default.corrected_bits),
+            (decoded.version, decoded.payload, decoded.corrected_bits)
+        );
+        assert_eq!(tm.decode(encoded.clone()).unwrap(), watermark);
+
+        let other = DecodeOptions::new().with_allowed_versions([Version::BchSuper]);
+        assert!(matches!(
+            tm.decode_with(encoded, &other),
+            Err(Error::CorruptWatermark)
+        ));
+    }
 
     #[test]
     fn loading_models() {
