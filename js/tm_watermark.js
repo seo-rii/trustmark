@@ -329,7 +329,7 @@ let session_encoder = null;
 let encoderLoadPromise = null;
 
 /**
- * Loads the encoder model once, after the models of trustmarkInit() (it needs the resizer).
+ * Loads the encoder model once, after the models of trustmarkInit().
  * @returns {Promise<ort.InferenceSession|null>} The session, or null if it failed to load.
  */
 function loadEncoder() {
@@ -361,7 +361,6 @@ async function trustmarkEncode(image, payload, options = {}) {
 
   const encoder = await loadEncoder();
   if (!encoder) throw modelNotLoadedError(encoderConfig.fname);
-  if (!session_resize) throw modelNotLoadedError('resizer');
 
   const pixels = await loadImageData(image);
   const startTime = Date.now();

@@ -61,7 +61,7 @@ Inference runs through a FIFO queue so that only one ONNX session runs at a time
 `trustmarkEncode(image, payload, options)` embeds a variant Q watermark with the `BCH_5` schema, following `TrustMark.encode` in the Python implementation:
 
 1. `DataLayer_Encode(payload, 1, eccengine)` builds the 100-bit packet: the payload, padded with zeros to 61 bits, then 35 BCH error correction bits and the 4 version bits `0001`. The payload is a string of `0` and `1` characters, never a number. Payloads that are longer than 61 bits or contain other characters are rejected.
-1. Images with an aspect ratio above 2:1 use their centred square; other images are used whole. That region is downscaled to 256x256 with the antialiased `resizer.onnx` model and scaled to [-1, 1].
+1. Images with an aspect ratio above 2:1 use their centred square; other images are used whole. That region is downscaled to 256x256 with the antialiased bilinear filter of Pillow's `Image.resize`, reproduced bit for bit in JavaScript (`TrustmarkCore.pillowBilinearResize`), and scaled to [-1, 1]. Embedding does not use `resizer.onnx`.
 1. `encoder_Q.onnx` produces the watermarked 256x256 image. The residual (output minus input, with the per-channel mean removed) is upscaled bilinearly to the region size, multiplied by `options.strength` (default 1.0, like Python), added to the original pixels and pasted back with feathered edges. The alpha channel is kept.
 
 ```js
@@ -90,7 +90,7 @@ const bits = await TrustmarkCore.decodeBits(runtime, decoderSession, watermarked
 Limitations:
 
 - Only variant Q with the `BCH_5` schema is supported for embedding. `DataLayer_Encode` matches the Python packets for all four schemas, but variants B, C and P (P needs its own crop and strength) are not implemented yet.
-- The 256x256 downscale uses `resizer.onnx` (antialiased bicubic) instead of the antialiased bilinear resize of Pillow that Python uses. Watermarks embedded by either implementation decode in both, but the JavaScript output differs slightly from the Python output and has a PSNR about 0.4 dB lower.
+- The JavaScript output differs from the Python output by at most 1 per channel, from the ONNX encoder and float rounding, and its PSNR is within 0.06 dB of Python's.
 - Pixel values are truncated to integers, as the Python implementation does.
 - In the browser, images go through a canvas: colour profiles are applied when the image is read, the canvas stores premultiplied alpha (so fully transparent pixels lose their colour, and semi-transparent pixels can shift slightly), and the downloaded PNG is RGBA without the original metadata. `tm_core.js` itself works on the exact RGBA values it is given.
 
@@ -109,7 +109,7 @@ To use the code in your own project, include the JavaScript files in the same or
 
 ## Run the tests
 
-The tests use the built-in Node.js test runner and need neither a browser nor, by default, the models: the data layer tests use packets produced by the Python implementation, the `tm_core.js` tests compare the resizing and residual pasting with PyTorch and Python results, and the `tm_watermark.js` tests replace ONNX Runtime, `fetch` and the DOM with fakes to check model loading, backend fallback, the inference queue, the result statuses and encoder failures. From the repository root:
+The tests use the built-in Node.js test runner and need neither a browser nor, by default, the models: the data layer tests use packets produced by the Python implementation, the `tm_core.js` tests compare the resizing with Pillow and PyTorch results and the residual pasting with Python results, and the `tm_watermark.js` tests replace ONNX Runtime, `fetch` and the DOM with fakes to check model loading, backend fallback, the inference queue, the result statuses and encoder failures. From the repository root:
 
 ```
 node --test js/tests/*.test.mjs

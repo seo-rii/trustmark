@@ -319,7 +319,9 @@ test('trustmarkEncode fails instead of returning an unwatermarked image', async 
   assert.equal(tm.get('trustmarkStatus')().models.encoder_Q.status, 'error');
 });
 
-test('trustmarkEncode fails when the resizer is missing', async () => {
+test('trustmarkEncode does not need the resizer', async () => {
   const tm = loadWatermark({ ort: fakeOrt(), fetch: fakeFetch({ missing: ['resizer'] }) });
-  await assert.rejects(tm.get('trustmarkEncode')(rgbaImage(8, 8), PAYLOAD), /resizer model is not loaded: could not download resizer\.onnx/);
+  const result = await tm.get('trustmarkEncode')(rgbaImage(8, 8), PAYLOAD);
+  assert.equal(result.packet, PACKET);
+  assert.equal(tm.get('trustmarkStatus')().models.resizer.status, 'error');
 });

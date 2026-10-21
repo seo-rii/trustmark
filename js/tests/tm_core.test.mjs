@@ -104,6 +104,45 @@ test('decodeBits feeds the resized region to the decoder in [-1, 1] and threshol
   await assert.rejects(core.decodeBits({ ort, resizer: null }, decoder, makeImage(4, 4), 256), /resizer model is not loaded/);
 });
 
+/** RGBA image with some texture: channel c of pixel (x, y) is (7x + 13y + 50c + 5((x * y) % 23)) % 256. */
+function makeTexture(width, height) {
+  const data = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      for (let c = 0; c < 3; c++) data[i + c] = (x * 7 + y * 13 + c * 50 + ((x * y) % 23) * 5) % 256;
+      data[i + 3] = (x + 3 * y) % 256;
+    }
+  }
+  return { data, width, height };
+}
+
+// SHA-256 of the planar RGB bytes of Image.resize((w, h), Image.BILINEAR) in Pillow 12.3 for
+// crops of makeTexture images converted to RGB
+const PILLOW_GOLDEN = [
+  { width: 640, height: 480, region: [0, 0, 640, 480], out: [256, 256], sha256: 'f9936364c4b735136c9cc21923d1675c7bc6e35e41ad88b40fb7d37c41128255' },
+  { width: 1001, height: 753, region: [0, 0, 1001, 753], out: [224, 224], sha256: 'a2851863c2d8dbca9840826468c8b463c2baf77091da4efcf0e939655d38db9b' },
+  { width: 240, height: 240, region: [0, 0, 240, 240], out: [256, 256], sha256: 'fd23731e5f157153f6f53eb5268d1acec8a1894128447d36ca1c3b8a0788a430' },
+  { width: 300, height: 256, region: [0, 0, 300, 256], out: [256, 256], sha256: 'b3deeebce7976fac549cc756fb6af92628fd1f1a78b46fa54b392f7d4983fd94' },
+  { width: 256, height: 300, region: [0, 0, 256, 300], out: [256, 256], sha256: '6d3e5a75ee0f743301da2e47163b165dfc53dc27eee1e4d159895376ae3452a2' },
+  { width: 520, height: 250, region: [135, 0, 250, 250], out: [256, 256], sha256: '00f9e159bc38d5cbcc5f4e46305c6f7a31fbcd9452fcf58c5b6862f27ff3af32' },
+  { width: 901, height: 200, region: [350, 0, 200, 200], out: [224, 224], sha256: '78ea3d095aad710fb981ef47cbccf2e9f71804f4d934709464ab984f4677ccef' },
+  { width: 37, height: 23, region: [3, 2, 31, 19], out: [61, 17], sha256: 'c47aa27269555e26eac28b00a6e1e918b4d168c4992a7a8fc10834dfd2e3800d' },
+];
+
+test('the bilinear resize is bit-exact with Pillow', () => {
+  for (const g of PILLOW_GOLDEN) {
+    const [left, top, width, height] = g.region;
+    const out = core.pillowBilinearResize(makeTexture(g.width, g.height), { left, top, width, height }, g.out[0], g.out[1]);
+    assert.equal(out.length, 3 * g.out[0] * g.out[1]);
+    assert.equal(crypto.createHash('sha256').update(out).digest('hex'), g.sha256, `${g.width}x${g.height} ${g.region} -> ${g.out}`);
+  }
+  // A region that keeps its size is copied
+  const image = makeTexture(9, 7);
+  const copy = core.pillowBilinearResize(image, { left: 2, top: 1, width: 5, height: 4 }, 5, 4);
+  assert.deepEqual(Array.from(copy), Array.from(core.rgbaToPlanar(image, { left: 2, top: 1, width: 5, height: 4 }), (v) => Math.round(v * 255)));
+});
+
 // torch.nn.functional.interpolate(x, size=(outH, outW), mode='bilinear') for
 // x[i] = (((i * 37) % 65) - 32) / 64 (values exactly representable in float32)
 const BILINEAR_GOLDEN = [
@@ -172,41 +211,49 @@ test('feather width follows the Python rule', () => {
   assert.equal(core.featherSize(9000, 6000), 50);
 });
 
-test('encodeWatermark runs the encoder in [-1, 1] and keeps alpha', async () => {
-  const feedsSeen = {};
-  const resizer = {
+/** Compares large byte arrays without the slow diff of assert.deepEqual. */
+function assertSameBytes(actual, expected, message) {
+  assert.equal(actual.length, expected.length, message);
+  const index = actual.findIndex((v, i) => v !== expected[i]);
+  assert.equal(index, -1, `${message}: first difference at ${index} (${actual[index]} vs ${expected[index]})`);
+}
+
+/** Fake encoder session that returns its input plus `delta(channel, index)`. */
+function fakeEncoder(delta, feedsSeen) {
+  return {
     async run(feeds) {
-      feedsSeen.resizer = feeds;
-      const size = Number(feeds.target_size.data[0]);
-      return { Y: new Tensor('float32', new Float32Array(3 * size * size).fill(0.25), [1, 3, size, size]) };
-    },
-  };
-  // An encoder that adds +0.1 to red and -0.1 to blue: after mean removal the residual is 0
-  const encoder = {
-    async run(feeds) {
-      feedsSeen.encoder = feeds;
+      feedsSeen.push(feeds);
       const input = feeds['onnx::Concat_0'].data;
       const plane = 256 * 256;
-      const out = Float32Array.from(input, (v, i) => v + (i < plane ? 0.1 : i >= 2 * plane ? -0.1 : 0));
+      const out = Float32Array.from(input, (v, i) => v + delta(Math.floor(i / plane), i % plane));
       return { image: new Tensor('float32', out, [1, 3, 256, 256]) };
     },
   };
-  const image = makeImage(300, 160);
+}
+
+test('encodeWatermark feeds the Pillow-resized region in [-1, 1] and keeps alpha', async () => {
+  const feedsSeen = [];
+  // An encoder that returns its input: the residual is 0
+  const encoder = fakeEncoder(() => 0, feedsSeen);
+  const image = makeTexture(300, 160);
   const packet = Array.from({ length: 100 }, (_, i) => i % 2);
 
-  const result = await core.encodeWatermark({ ort, resizer }, encoder, image, packet);
+  // The encoder does not need the resizer model
+  const result = await core.encodeWatermark({ ort }, encoder, image, packet);
 
-  assert.deepEqual(feedsSeen.resizer.X.dims, [1, 3, 160, 300]);
-  assert.deepEqual(feedsSeen.encoder['onnx::Concat_0'].dims, [1, 3, 256, 256]);
-  assert.ok(feedsSeen.encoder['onnx::Concat_0'].data.every((v) => v === -0.5), 'cover is scaled to [-1, 1]');
-  assert.deepEqual(feedsSeen.encoder['onnx::Gemm_1'].dims, [1, 100]);
-  assert.deepEqual(Array.from(feedsSeen.encoder['onnx::Gemm_1'].data), packet);
+  const cover = feedsSeen[0]['onnx::Concat_0'];
+  assert.deepEqual(cover.dims, [1, 3, 256, 256]);
+  const resized = core.pillowBilinearResize(image, core.processingRegion(300, 160), 256, 256);
+  // transforms.ToTensor() then * 2 - 1, in float32
+  cover.data.forEach((v, k) => assert.equal(v, Math.fround(Math.fround(resized[k] / 255) * 2 - 1)));
+  assert.deepEqual(feedsSeen[0]['onnx::Gemm_1'].dims, [1, 100]);
+  assert.deepEqual(Array.from(feedsSeen[0]['onnx::Gemm_1'].data), packet);
 
   assert.equal(result.width, 300);
   assert.equal(result.height, 160);
   // A zero residual reproduces the cover up to the truncation the Python implementation does
   const zero = core.applyResidual(image, core.processingRegion(300, 160), new Float32Array(3 * 300 * 160), 1.0);
-  assert.deepEqual(result.data, zero);
+  assertSameBytes(result.data, zero, 'zero residual');
   for (let i = 0; i < image.data.length; i++) {
     if (i % 4 === 3) assert.equal(result.data[i], image.data[i]);
     else assert.ok(image.data[i] - result.data[i] <= 1 && image.data[i] - result.data[i] >= 0);
@@ -220,7 +267,6 @@ test('encodeWatermark rejects invalid input and missing models', async () => {
   const packet = new Array(100).fill(0);
 
   await assert.rejects(core.encodeWatermark(runtime, null, image, packet), /encoder model is not loaded/);
-  await assert.rejects(core.encodeWatermark({ ort, resizer: null }, session, image, packet), /resizer model is not loaded/);
   await assert.rejects(core.encodeWatermark(runtime, session, image, packet.slice(1)), /100 bits/);
   await assert.rejects(core.encodeWatermark(runtime, session, image, [...packet.slice(1), 2]), /100 bits/);
   await assert.rejects(core.encodeWatermark(runtime, session, { data: new Uint8Array(10), width: 8, height: 8 }, packet), /RGBA data/);
