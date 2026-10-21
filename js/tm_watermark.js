@@ -57,6 +57,10 @@ const trustmarkReady = new Promise((resolve) => { resolveTrustmarkReady = resolv
  * @param {Array<string>} [options.decoders=['Q', 'P']] - Variants whose decoders runwmark uses,
  *   in the order they are tried: any of 'Q', 'P', 'B' and 'C'. An empty list loads no decoder,
  *   for pages that only embed watermarks.
+ * @param {boolean} [options.warmUp=true] - Run the resizer and each decoder once on a blank image
+ *   while loading, so that one-time start-up costs do not delay the first runwmark call, and fall
+ *   back to the next backend if that inference fails. With false, only WebGPU sessions are run
+ *   (and checked) while loading.
  * @returns {Promise<Object>} Resolves with trustmarkStatus().
  * @throws {Error} If `decoders` names an unknown variant (nothing is loaded then).
  */
@@ -76,6 +80,7 @@ function trustmarkInit(options = {}) {
 
   const baseUrl = options.modelBaseUrl || MODEL_BASE_URL;
   const executionProviders = options.executionProviders || DEFAULT_EXECUTION_PROVIDERS;
+  const warmUp = options.warmUp === undefined ? true : Boolean(options.warmUp);
   trustmarkOptions = { baseUrl, executionProviders };  // also used to load the encoders later
 
   const decoderNames = decoderVariants.map((code) => TrustmarkCore.getVariant(code).decoder);
@@ -85,10 +90,10 @@ function trustmarkInit(options = {}) {
 
   trustmarkInitPromise = (async () => {
     // The resizer must run on WASM: WebGPU's Resize does not support antialiasing
-    if (decoderNames.length) session_resize = await loadModelSession('resizer', baseUrl, ['wasm']);
+    if (decoderNames.length) session_resize = await loadModelSession('resizer', baseUrl, ['wasm'], warmUp);
     for (const name of decoderNames) {
-      // WebGPU sessions can fail silently, so check them first
-      const session = await loadModelSession(name, baseUrl, executionProviders, 'webgpu');
+      // WebGPU sessions are always checked, since they can fail silently
+      const session = await loadModelSession(name, baseUrl, executionProviders, warmUp ? true : 'webgpu');
       if (session) sessions[name] = session;
     }
     trustmarkLoaded = true;
@@ -251,7 +256,8 @@ function warmUpSession(session, name, backend) {
       const errors = (await Promise.all(scopes.map(() => device.popErrorScope()))).filter(Boolean);
       if (errors.length) throw new Error(`WebGPU error: ${errors[0].message}`);
     }
-    if (Object.values(outputs).every((tensor) => tensor.data.every((v) => v === 0))) {
+    // (The resizer rightly returns zeros for a blank image)
+    if (name !== 'resizer' && Object.values(outputs).every((tensor) => tensor.data.every((v) => v === 0))) {
       throw new Error('the model returned only zeros');
     }
   });

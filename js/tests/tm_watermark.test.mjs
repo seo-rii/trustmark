@@ -439,7 +439,38 @@ test('trustmarkEncode rejects unknown variants, schemas and strengths before dow
   assert.ok(!fetchLog.some((url) => url.includes('encoder_')), 'no encoder was downloaded');
 });
 
-test('a WebGPU session whose first inference fails falls back to the next backend', async () => {
+test('decoders run once on a blank image while loading, unless warmUp is false', async () => {
+  const ort = fakeOrt({ decoderOutputs: { decoder_Q: watermarked, decoder_P: noise } });
+  const tm = loadWatermark({ ort, fetch: fakeFetch() });
+
+  const { models } = await tm.get('trustmarkReady');
+  assert.deepEqual(ort.runs.map((r) => r.name), ['resizer', 'decoder_Q', 'decoder_P']);
+  assert.deepEqual(plain(ort.runs[0].feeds.X.dims), [1, 3, 8, 8]);
+  assert.deepEqual(plain(ort.runs[1].feeds.image.dims), [1, 3, 256, 256]);
+  assert.deepEqual(plain(ort.runs[2].feeds.image.dims), [1, 3, 224, 224]);
+  assert.ok(ort.runs.slice(1).every((r) => r.feeds.image.data.every((v) => v === 0)), 'the warm-up input is blank');
+  for (const name of ['resizer', 'decoder_Q', 'decoder_P']) assert.equal(typeof models[name].warmUpMs, 'number', name);
+
+  const result = await tm.get('runwmark')('image.png');
+  assert.equal(result.status, 'detected');
+
+  // Without warmUp, only WebGPU sessions are run while loading
+  const cold = fakeOrt({ decoderOutputs: { decoder_Q: noise, decoder_P: noise } });
+  const lazy = loadWatermark({ ort: cold, fetch: fakeFetch(), autoInit: false });
+  const status = await lazy.get('trustmarkInit')({ warmUp: false, executionProviders: ['wasm'] });
+  assert.equal(cold.runs.length, 0);
+  assert.equal(status.models.decoder_Q.warmUpMs, null);
+  assert.equal(status.models.decoder_Q.status, 'ready');
+
+  const gpu = fakeOrt({ zeroRun: (name, backend) => backend === 'webgpu' && name === 'decoder_P' });
+  const checked = loadWatermark({ ort: gpu, fetch: fakeFetch(), autoInit: false });
+  const gpuStatus = await checked.get('trustmarkInit')({ warmUp: false });
+  assert.deepEqual(plain(gpu.runs.map((r) => [r.name, r.backend])), [['decoder_Q', 'webgpu'], ['decoder_P', 'webgpu']]);
+  assert.equal(gpuStatus.models.decoder_Q.backend, 'webgpu');
+  assert.equal(gpuStatus.models.decoder_P.backend, 'wasm');
+});
+
+test('a backend whose warm-up inference fails falls back to the next one', async () => {
   const ort = fakeOrt({
     failRun: (name, backend) => (backend === 'webgpu' && name === 'decoder_P' ? 'unsupported operator' : null),
     decoderOutputs: { decoder_Q: noise, decoder_P: watermarked },

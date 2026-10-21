@@ -85,14 +85,22 @@
   }
 
   /**
-   * Returns all-zero inputs for an encoder or decoder model, e.g. for a first inference that checks
-   * that a session works.
+   * Returns all-zero inputs for a model, e.g. for a first inference that absorbs one-time costs
+   * (WebAssembly thread start-up, WebGPU shader compilation).
    * @param {Object} ort - The onnxruntime module.
-   * @param {string} name - Model name: 'encoder_<variant>' or 'decoder_<variant>'.
-   * @returns {Object} The feeds.
+   * @param {string} name - Model name: 'resizer', 'encoder_<variant>' or 'decoder_<variant>'.
+   * @returns {Object} The feeds (a small 8x8 image for the resizer).
    * @throws {Error} For another model name.
    */
   function zeroFeeds(ort, name) {
+    if (name === 'resizer') {
+      const dims = [1, 3, 8, 8];
+      return {
+        'X': new ort.Tensor('float32', new Float32Array(3 * 8 * 8), dims),
+        'scales': new ort.Tensor('float32', computeScalesFixed([4, 4], dims), [4]),
+        'target_size': new ort.Tensor('int64', new BigInt64Array([4n]), [1]),
+      };
+    }
     const match = /^(encoder|decoder)_(.+)$/.exec(name);
     if (!match) throw new Error(`no zero inputs are defined for the ${name} model`);
     const variant = getVariant(match[2]);

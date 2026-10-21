@@ -365,9 +365,11 @@ test('zeroFeeds builds blank inputs for every model', () => {
   const encoder = core.zeroFeeds(ort, 'encoder_C');
   assert.deepEqual(encoder['onnx::Concat_0'].dims, [1, 3, 256, 256]);
   assert.deepEqual(encoder['onnx::Gemm_1'].dims, [1, 100]);
+  const resizer = core.zeroFeeds(ort, 'resizer');
+  assert.deepEqual(resizer.X.dims, [1, 3, 8, 8]);
+  assert.equal(Number(resizer.target_size.data[0]), 4);
   assert.throws(() => core.zeroFeeds(ort, 'decoder_Z'), /Unknown TrustMark variant/);
   assert.throws(() => core.zeroFeeds(ort, 'remover_Q'), /no zero inputs are defined for the remover_Q model/);
-  assert.throws(() => core.zeroFeeds(ort, 'resizer'), /no zero inputs are defined for the resizer model/);
 });
 
 test('applyResidual upscales a small residual exactly like bilinearResize', () => {
