@@ -165,6 +165,8 @@
   /**
    * Runs a watermark decoder on an image and returns the raw packet bits.
    * The bits still need error correction, e.g. with DataLayer_Decode.
+   * The decoder sees the resized pixels in [-1, 1], the range the decoders were trained on and
+   * that the Python (ToTensor() * 2 - 1) and Rust implementations feed them.
    *
    * @param {Object} runtime - { ort, resizer, run } (see the top of this file).
    * @param {Object} decoder - InferenceSession of the decoder model.
@@ -175,7 +177,8 @@
    */
   async function decodeBits(runtime, decoder, image, resolution, forceSquare = false) {
     const { pixels } = await preprocess(runtime, image, resolution, forceSquare);
-    const input = new runtime.ort.Tensor('float32', pixels, [1, 3, resolution, resolution]);
+    const scaled = Float32Array.from(pixels, (v) => v * 2.0 - 1.0);  // [0, 1] -> [-1, 1]
+    const input = new runtime.ort.Tensor('float32', scaled, [1, 3, resolution, resolution]);
     const results = await runSession(runtime, decoder, { image: input });
     return Array.from(results['output'].data, (v) => v >= 0);
   }
