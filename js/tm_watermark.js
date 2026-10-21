@@ -87,7 +87,8 @@ function trustmarkInit(options = {}) {
     // The resizer must run on WASM: WebGPU's Resize does not support antialiasing
     if (decoderNames.length) session_resize = await loadModelSession('resizer', baseUrl, ['wasm']);
     for (const name of decoderNames) {
-      const session = await loadModelSession(name, baseUrl, executionProviders);
+      // WebGPU sessions can fail silently, so check them first
+      const session = await loadModelSession(name, baseUrl, executionProviders, 'webgpu');
       if (session) sessions[name] = session;
     }
     trustmarkLoaded = true;
@@ -117,19 +118,26 @@ function trustmarkStatus() {
  * @returns {Object} The state.
  */
 function newModelState(status) {
-  return { status, backend: null, fallbackFrom: null, fallbackReason: null, error: null, loadMs: null };
+  return { status, backend: null, fallbackFrom: null, fallbackReason: null, error: null, loadMs: null, warmUpMs: null };
 }
 
 /**
  * Downloads an ONNX model once and creates a session on the first backend that works.
  * The outcome is recorded in modelStates[name]; failures are recorded rather than thrown.
  *
+ * With warmUp, the session also runs once on all-zero inputs before it is used (warmUpSession):
+ * the first inference pays one-time costs (WebAssembly thread start-up, WebGPU shader
+ * compilation) that would otherwise delay the first image, and a backend whose inference fails
+ * is skipped like one whose session cannot be created.
+ *
  * @param {string} name - Model name; the file is `${baseUrl}${name}.onnx`.
  * @param {string} baseUrl - Base URL of the model files.
  * @param {Array<string>} executionProviders - Backends to try, in order.
+ * @param {boolean|string} [warmUp=false] - Run a first inference: true on every backend, or
+ *   'webgpu' to only check WebGPU sessions.
  * @returns {Promise<ort.InferenceSession|null>} The session, or null if none could be created.
  */
-async function loadModelSession(name, baseUrl, executionProviders) {
+async function loadModelSession(name, baseUrl, executionProviders, warmUp = false) {
   const state = newModelState('loading');
   modelStates[name] = state;
   const startTime = Date.now();
@@ -150,6 +158,16 @@ async function loadModelSession(name, baseUrl, executionProviders) {
   for (const backend of executionProviders) {
     try {
       const session = await ort.InferenceSession.create(model, { executionProviders: [backend] });
+      if (warmUp === true || (warmUp === 'webgpu' && backend === 'webgpu')) {
+        const warmUpStart = Date.now();
+        try {
+          await warmUpSession(session, name, backend);
+        } catch (error) {
+          Promise.resolve().then(() => session.release()).catch(() => {});
+          throw new Error(`warm-up inference failed: ${errorMessage(error)}`);
+        }
+        state.warmUpMs = Date.now() - warmUpStart;
+      }
       state.status = 'ready';
       state.backend = backend;
       state.loadMs = Date.now() - startTime;
@@ -194,10 +212,49 @@ let inferenceQueue = Promise.resolve();
  * @returns {Promise<Object>} The session outputs; rejects if this inference fails.
  */
 function safeRunInference(session, feed) {
-  const result = inferenceQueue.then(() => session.run(feed));
+  return enqueueInference(() => session.run(feed));
+}
+
+/**
+ * Runs a task that uses a session after every previously queued inference has finished.
+ * @param {function(): Promise<*>} task - The task.
+ * @returns {Promise<*>} The result of the task; rejects if the task fails.
+ */
+function enqueueInference(task) {
+  const result = inferenceQueue.then(task);
   // A failed inference must not stall the queue; the caller still receives the rejection
   inferenceQueue = result.then(() => undefined, () => undefined);
   return result;
+}
+
+/**
+ * Runs a new session once on all-zero inputs and checks that it works. ONNX Runtime Web can
+ * resolve a WebGPU inference whose shaders failed to compile with outputs that are all zeros,
+ * so WebGPU errors raised during the run, and encoder or decoder outputs that are all zeros, are
+ * failures too.
+ *
+ * @param {ort.InferenceSession} session - The session.
+ * @param {string} name - Model name.
+ * @param {string} backend - Execution provider of the session.
+ * @returns {Promise<void>} Rejects if the inference failed.
+ */
+function warmUpSession(session, name, backend) {
+  const feeds = TrustmarkCore.zeroFeeds(ort, name);
+  return enqueueInference(async () => {
+    const device = backend === 'webgpu' && ort.env && ort.env.webgpu ? ort.env.webgpu.device : null;
+    const scopes = device ? ['validation', 'out-of-memory', 'internal'] : [];
+    scopes.forEach((filter) => device.pushErrorScope(filter));
+    let outputs;
+    try {
+      outputs = await session.run(feeds);
+    } finally {
+      const errors = (await Promise.all(scopes.map(() => device.popErrorScope()))).filter(Boolean);
+      if (errors.length) throw new Error(`WebGPU error: ${errors[0].message}`);
+    }
+    if (Object.values(outputs).every((tensor) => tensor.data.every((v) => v === 0))) {
+      throw new Error('the model returned only zeros');
+    }
+  });
 }
      
 
@@ -355,7 +412,8 @@ function loadEncoder(variant) {
   if (!encoderLoads[name]) {
     modelStates[name] = newModelState('pending');
     encoderLoads[name] = trustmarkInit().then(async () => {
-      const session = await loadModelSession(name, trustmarkOptions.baseUrl, trustmarkOptions.executionProviders);
+      // A WebGPU encoder that silently returns zeros would destroy the image, so check it first
+      const session = await loadModelSession(name, trustmarkOptions.baseUrl, trustmarkOptions.executionProviders, 'webgpu');
       if (session) sessions[name] = session;
       return session;
     });

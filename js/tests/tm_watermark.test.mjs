@@ -33,9 +33,12 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
 
 /**
  * Minimal stand-in for onnxruntime-web. Model "files" contain their own name so the fake
- * session knows what it is. Decoders return `decoderOutputs[name]` (100 floats).
+ * session knows what it is. Decoders return `decoderOutputs[name]` (100 floats, all -1 by
+ * default). `failRun(name, backend)` can make inference fail, `zeroRun(name, backend)` makes it
+ * return zeros, and `gpuError(name)` raises a WebGPU error that the error scopes of
+ * env.webgpu.device report.
  */
-function fakeOrt({ failCreate = () => null, decoderOutputs = {}, runLog = [] } = {}) {
+function fakeOrt({ failCreate = () => null, failRun = () => null, zeroRun = () => false, gpuError = () => null, decoderOutputs = {}, runLog = [] } = {}) {
   class Tensor {
     constructor(type, data, dims) {
       this.type = type;
@@ -45,6 +48,13 @@ function fakeOrt({ failCreate = () => null, decoderOutputs = {}, runLog = [] } =
   }
   const created = [];
   const encoderFeeds = [];
+  const runs = [];
+  const released = [];
+  const scopes = [];
+  const device = {
+    pushErrorScope(filter) { scopes.push({ filter, error: null }); },
+    async popErrorScope() { return scopes.pop().error; },
+  };
   const InferenceSession = {
     async create(model, options) {
       const name = new TextDecoder().decode(model);
@@ -53,22 +63,33 @@ function fakeOrt({ failCreate = () => null, decoderOutputs = {}, runLog = [] } =
       const failure = failCreate(name, backend);
       if (failure) throw new Error(failure);
       return {
+        async release() { released.push({ name, backend }); },
         async run(feeds) {
           runLog.push(name);
+          runs.push({ name, backend, feeds });
+          const runFailure = failRun(name, backend);
+          if (runFailure) throw new Error(runFailure);
+          const error = backend === 'webgpu' ? gpuError(name) : null;
+          if (error && scopes.length) scopes[0].error = { message: error };
+          if (zeroRun(name, backend)) {
+            const output = name.startsWith('encoder_') ? 'image' : 'output';
+            return { [output]: new Tensor('float32', new Float32Array(name.startsWith('encoder_') ? 3 * 256 * 256 : 100), []) };
+          }
           if (name === 'resizer') {
             const size = Number(feeds.target_size.data[0]);
             return { Y: new Tensor('float32', new Float32Array(3 * size * size), [1, 3, size, size]) };
           }
           if (name.startsWith('encoder_')) {
             encoderFeeds.push({ name, feeds });
-            return { image: feeds['onnx::Concat_0'] };
+            const cover = feeds['onnx::Concat_0'];
+            return { image: new Tensor('float32', Float32Array.from(cover.data, (v) => v + 0.5), cover.dims) };
           }
-          return { output: new Tensor('float32', Float32Array.from(decoderOutputs[name]), [1, 100]) };
+          return { output: new Tensor('float32', Float32Array.from(decoderOutputs[name] || new Array(100).fill(-1)), [1, 100]) };
         },
       };
     },
   };
-  return { Tensor, InferenceSession, created, encoderFeeds };
+  return { Tensor, InferenceSession, env: { webgpu: { device } }, created, encoderFeeds, runs, released, scopes };
 }
 
 /** Fake fetch serving `${BASE_URL}${name}.onnx`; `gate` can hold responses back. */
@@ -416,4 +437,53 @@ test('trustmarkEncode rejects unknown variants, schemas and strengths before dow
   await assert.rejects(encode(rgbaImage(8, 8), '1'.repeat(41), { variant: 'P', schema: 'BCH_SUPER' }), /41 bits but BCH_SUPER allows at most 40 bits/);
   await tm.get('trustmarkReady');
   assert.ok(!fetchLog.some((url) => url.includes('encoder_')), 'no encoder was downloaded');
+});
+
+test('a WebGPU session whose first inference fails falls back to the next backend', async () => {
+  const ort = fakeOrt({
+    failRun: (name, backend) => (backend === 'webgpu' && name === 'decoder_P' ? 'unsupported operator' : null),
+    decoderOutputs: { decoder_Q: noise, decoder_P: watermarked },
+  });
+  const tm = loadWatermark({ ort, fetch: fakeFetch() });
+
+  const { models } = await tm.get('trustmarkReady');
+  assert.equal(models.decoder_Q.backend, 'webgpu');
+  assert.equal(models.decoder_P.status, 'ready');
+  assert.equal(models.decoder_P.backend, 'wasm');
+  assert.equal(models.decoder_P.fallbackFrom, 'webgpu');
+  assert.match(models.decoder_P.fallbackReason, /webgpu: warm-up inference failed: unsupported operator/);
+  assert.deepEqual(plain(ort.released), [{ name: 'decoder_P', backend: 'webgpu' }], 'the failed session is released');
+
+  const result = await tm.get('runwmark')('image.png');
+  assert.equal(result.status, 'detected');
+  assert.equal(result.variant, 'P');
+  assert.equal(result.backend, 'wasm');
+});
+
+test('WebGPU sessions that return zeros or raise WebGPU errors fall back to WASM', async () => {
+  const ort = fakeOrt({
+    zeroRun: (name, backend) => backend === 'webgpu' && (name === 'decoder_Q' || name === 'encoder_Q'),
+    gpuError: (name) => (name === 'decoder_P' ? 'Invalid ComputePipeline "Cast"' : null),
+    decoderOutputs: { decoder_Q: watermarked, decoder_P: noise },
+  });
+  const tm = loadWatermark({ ort, fetch: fakeFetch() });
+
+  const { models } = await tm.get('trustmarkReady');
+  assert.equal(models.decoder_Q.backend, 'wasm');
+  assert.match(models.decoder_Q.fallbackReason, /webgpu: warm-up inference failed: the model returned only zeros/);
+  assert.equal(models.decoder_P.backend, 'wasm');
+  assert.match(models.decoder_P.fallbackReason, /webgpu: warm-up inference failed: WebGPU error: Invalid ComputePipeline "Cast"/);
+  assert.equal(ort.scopes.length, 0, 'every error scope is popped');
+
+  const decoded = await tm.get('runwmark')('image.png');
+  assert.equal(decoded.status, 'detected');
+  assert.equal(decoded.backend, 'wasm');
+
+  // Encoders are checked on WebGPU before their first use too
+  const encoded = await tm.get('trustmarkEncode')(rgbaImage(8, 8), PAYLOAD);
+  assert.equal(encoded.backend, 'wasm');
+  const { encoder_Q } = tm.get('trustmarkStatus')().models;
+  assert.match(encoder_Q.fallbackReason, /webgpu: warm-up inference failed: the model returned only zeros/);
+  assert.equal(encoder_Q.warmUpMs, null, 'the WASM encoder is not warmed up');
+  assert.deepEqual(plain(ort.runs.filter((r) => r.name === 'encoder_Q').map((r) => r.backend)), ['webgpu', 'wasm']);
 });

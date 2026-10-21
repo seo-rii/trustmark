@@ -358,6 +358,18 @@ test('resolveEncodeOptions applies the defaults', () => {
   assert.throws(() => core.resolveEncodeOptions({ strength: Infinity }), /strength/);
 });
 
+test('zeroFeeds builds blank inputs for every model', () => {
+  const decoder = core.zeroFeeds(ort, 'decoder_P');
+  assert.deepEqual(decoder.image.dims, [1, 3, 224, 224]);
+  assert.ok(decoder.image.data.every((v) => v === 0));
+  const encoder = core.zeroFeeds(ort, 'encoder_C');
+  assert.deepEqual(encoder['onnx::Concat_0'].dims, [1, 3, 256, 256]);
+  assert.deepEqual(encoder['onnx::Gemm_1'].dims, [1, 100]);
+  assert.throws(() => core.zeroFeeds(ort, 'decoder_Z'), /Unknown TrustMark variant/);
+  assert.throws(() => core.zeroFeeds(ort, 'remover_Q'), /no zero inputs are defined for the remover_Q model/);
+  assert.throws(() => core.zeroFeeds(ort, 'resizer'), /no zero inputs are defined for the resizer model/);
+});
+
 test('applyResidual upscales a small residual exactly like bilinearResize', () => {
   const residual = Float32Array.from({ length: 3 * 256 * 256 }, (_, i) => (((i * 37) % 65) - 32) / 1024);
   for (const [width, height, square] of [[240, 240, false], [257, 255, false], [1001, 333, false], [61, 37, true]]) {

@@ -85,6 +85,29 @@
   }
 
   /**
+   * Returns all-zero inputs for an encoder or decoder model, e.g. for a first inference that checks
+   * that a session works.
+   * @param {Object} ort - The onnxruntime module.
+   * @param {string} name - Model name: 'encoder_<variant>' or 'decoder_<variant>'.
+   * @returns {Object} The feeds.
+   * @throws {Error} For another model name.
+   */
+  function zeroFeeds(ort, name) {
+    const match = /^(encoder|decoder)_(.+)$/.exec(name);
+    if (!match) throw new Error(`no zero inputs are defined for the ${name} model`);
+    const variant = getVariant(match[2]);
+    if (match[1] === 'decoder') {
+      const size = variant.decodeResolution;
+      return { image: new ort.Tensor('float32', new Float32Array(3 * size * size), [1, 3, size, size]) };
+    }
+    const size = variant.encodeResolution;
+    return {
+      'onnx::Concat_0': new ort.Tensor('float32', new Float32Array(3 * size * size), [1, 3, size, size]),
+      'onnx::Gemm_1': new ort.Tensor('float32', new Float32Array(PACKET_BITS), [1, PACKET_BITS]),
+    };
+  }
+
+  /**
    * Returns the part of the image the watermark models see: the whole image, or the centred
    * square when the aspect ratio exceeds 2:1 (or when forceSquare is set, as for variant P).
    * Matches TrustMark.get_the_image_for_processing in the Python implementation.
@@ -591,6 +614,7 @@
     VARIANTS,
     getVariant,
     resolveEncodeOptions,
+    zeroFeeds,
     processingRegion,
     rgbaToPlanar,
     computeScalesFixed,
