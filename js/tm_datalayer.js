@@ -174,6 +174,21 @@ function DataLayer_GetSchemaDataBits(version) {
 }
 
 /**
+ * Returns the schema version for a schema name or version, as numbered by TrustMark.Encoding in
+ * the Python implementation.
+ *
+ * @param {string|number} schema - 'BCH_SUPER', 'BCH_5', 'BCH_4' or 'BCH_3', or 0 to 3.
+ * @returns {number} The schema version (0 BCH_SUPER, 1 BCH_5, 2 BCH_4, 3 BCH_3).
+ * @throws {Error} For an unknown schema.
+ */
+function DataLayer_GetSchemaVersion(schema) {
+  for (let version = 0; version < DATALAYER_SCHEMA_COUNT; version++) {
+    if (schema === version || schema === DataLayer_GetSchemaName(version)) return version;
+  }
+  throw new Error(`Unknown watermark schema ${JSON.stringify(schema)}; expected BCH_SUPER, BCH_5, BCH_4, BCH_3 or 0 to 3`);
+}
+
+/**
  * Retrieves the name of the schema for the given version.
  *
  * @param {number} version - The schema version.

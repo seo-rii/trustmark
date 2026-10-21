@@ -40,6 +40,51 @@
   const PACKET_BITS = 100;
 
   /**
+   * Settings of each TrustMark variant, shared by embedding and decoding, from TrustMark.__init__
+   * and TrustMark.encode in the Python implementation:
+   *   - encoder, decoder: ONNX model names (`${name}.onnx`)
+   *   - encodeResolution, decodeResolution: model input sizes. The Python decoders of B, C and Q
+   *     run at 245x245, but their ONNX exports take 256x256 inputs.
+   *   - forceSquare: always process the centred square (P), instead of only above a 2:1 aspect ratio
+   *   - strengthMultiplier: factor applied to the requested watermark strength (P: 1.25)
+   */
+  const VARIANTS = Object.freeze({
+    Q: Object.freeze({ code: 'Q', encoder: 'encoder_Q', decoder: 'decoder_Q', encodeResolution: ENCODER_RESOLUTION, decodeResolution: 256, forceSquare: false, strengthMultiplier: 1.0 }),
+    P: Object.freeze({ code: 'P', encoder: 'encoder_P', decoder: 'decoder_P', encodeResolution: ENCODER_RESOLUTION, decodeResolution: 224, forceSquare: true, strengthMultiplier: 1.25 }),
+    B: Object.freeze({ code: 'B', encoder: 'encoder_B', decoder: 'decoder_B', encodeResolution: ENCODER_RESOLUTION, decodeResolution: 256, forceSquare: false, strengthMultiplier: 1.0 }),
+    C: Object.freeze({ code: 'C', encoder: 'encoder_C', decoder: 'decoder_C', encodeResolution: ENCODER_RESOLUTION, decodeResolution: 256, forceSquare: false, strengthMultiplier: 1.0 }),
+  });
+
+  /**
+   * Returns the settings of a variant.
+   * @param {string} code - Variant code: 'Q', 'P', 'B' or 'C'.
+   * @returns {Object} The VARIANTS entry.
+   * @throws {Error} For an unknown variant.
+   */
+  function getVariant(code) {
+    if (typeof code !== 'string' || !Object.prototype.hasOwnProperty.call(VARIANTS, code)) {
+      throw new Error(`Unknown TrustMark variant ${JSON.stringify(code)}; expected one of ${Object.keys(VARIANTS).join(', ')}`);
+    }
+    return VARIANTS[code];
+  }
+
+  /**
+   * Validates the options of encodeWatermark and applies their defaults.
+   * @param {Object} [options] - { variant = 'Q', strength = 1.0 }.
+   * @returns {{variant: Object, strength: number}} The VARIANTS entry and the requested strength
+   *   (before the variant's multiplier).
+   * @throws {Error} For an unknown variant or a negative or non-numeric strength.
+   */
+  function resolveEncodeOptions(options = {}) {
+    const variant = getVariant(options.variant === undefined ? 'Q' : options.variant);
+    const strength = options.strength === undefined ? 1.0 : options.strength;
+    if (!(typeof strength === 'number' && strength >= 0 && Number.isFinite(strength))) {
+      throw new Error('strength must be a non-negative number');
+    }
+    return { variant, strength };
+  }
+
+  /**
    * Returns the part of the image the watermark models see: the whole image, or the centred
    * square when the aspect ratio exceeds 2:1 (or when forceSquare is set, as for variant P).
    * Matches TrustMark.get_the_image_for_processing in the Python implementation.
@@ -312,13 +357,14 @@
    * that the Python (ToTensor() * 2 - 1) and Rust implementations feed them.
    *
    * @param {Object} runtime - { ort, resizer, run } (see the top of this file).
-   * @param {Object} decoder - InferenceSession of the decoder model.
+   * @param {Object} decoder - InferenceSession of the decoder model of the variant.
    * @param {{data: ArrayLike<number>, width: number, height: number}} image - The RGBA image.
-   * @param {number} resolution - Decoder resolution (Q: 256, P: 224).
-   * @param {boolean} [forceSquare=false] - Always use the centred square (variant P).
+   * @param {string} [variant='Q'] - Variant code of the decoder; selects its resolution and crop
+   *   (see VARIANTS).
    * @returns {Promise<Array<boolean>>} The 100 packet bits.
    */
-  async function decodeBits(runtime, decoder, image, resolution, forceSquare = false) {
+  async function decodeBits(runtime, decoder, image, variant = 'Q') {
+    const { decodeResolution: resolution, forceSquare } = getVariant(variant);
     const { pixels } = await preprocess(runtime, image, resolution, forceSquare);
     const scaled = Float32Array.from(pixels, (v) => v * 2.0 - 1.0);  // [0, 1] -> [-1, 1]
     const input = new runtime.ort.Tensor('float32', scaled, [1, 3, resolution, resolution]);
@@ -436,36 +482,34 @@
   /**
    * Embeds a watermark packet into an image with a TrustMark encoder model, following
    * TrustMark.encode in the Python implementation: the processing region (the centred square for
-   * aspect ratios above 2:1) is downscaled to 256x256 exactly like Pillow's bilinear resize, then
-   * come encoder inference, per-channel mean removal of the residual, bilinear upscale of the
-   * residual and a feathered paste into the original pixels. The alpha channel is preserved.
-   *
-   * Only variant Q has been verified; P would need its 1.25 strength multiplier and square crop.
+   * aspect ratios above 2:1, and always for variant P) is downscaled to 256x256 exactly like
+   * Pillow's bilinear resize, then come encoder inference, per-channel mean removal of the
+   * residual, bilinear upscale of the residual, the variant's strength multiplier and a feathered
+   * paste into the original pixels. The alpha channel is preserved.
    *
    * @param {Object} runtime - { ort, run } (see the top of this file); the resizer is not needed.
-   * @param {Object} encoder - InferenceSession of the encoder model (encoder_Q.onnx).
+   * @param {Object} encoder - InferenceSession of the encoder model of the variant (e.g. encoder_Q.onnx).
    * @param {{data: ArrayLike<number>, width: number, height: number}} image - The RGBA cover image.
    * @param {ArrayLike<number>} packet - The 100 packet bits (0/1), e.g. from DataLayer_Encode.
    * @param {Object} [options]
-   * @param {number} [options.strength=1.0] - Watermark strength (WM_STRENGTH in Python).
+   * @param {string} [options.variant='Q'] - Variant code of the encoder (see VARIANTS).
+   * @param {number} [options.strength=1.0] - Watermark strength (WM_STRENGTH in Python); variant P
+   *   multiplies it by 1.25 as Python does.
    * @returns {Promise<{data: Uint8ClampedArray, width: number, height: number}>} The watermarked image.
    */
   async function encodeWatermark(runtime, encoder, image, packet, options = {}) {
     const { ort } = runtime;
-    const strength = options.strength === undefined ? 1.0 : options.strength;
+    const { variant: config, strength } = resolveEncodeOptions(options);
     if (!encoder) throw new Error('encoder model is not loaded');
     if (!packet || packet.length !== PACKET_BITS || !Array.from(packet).every((b) => b === 0 || b === 1)) {
       throw new Error(`the packet must contain ${PACKET_BITS} bits of 0 or 1`);
-    }
-    if (!(typeof strength === 'number' && strength >= 0 && Number.isFinite(strength))) {
-      throw new Error('strength must be a non-negative number');
     }
     if (!image || !(image.width > 0) || !(image.height > 0) || !image.data || image.data.length !== image.width * image.height * 4) {
       throw new Error('the image must be RGBA data with a positive width and height');
     }
 
-    const size = ENCODER_RESOLUTION;
-    const region = processingRegion(image.width, image.height);
+    const size = config.encodeResolution;
+    const region = processingRegion(image.width, image.height, config.forceSquare);
     // ToTensor() in [0, 1], then scaled to the [-1, 1] range of the encoder, in float32 like PyTorch
     const cover = new Float32Array(3 * size * size);
     pillowBilinearResize(image, region, size, size).forEach((v, k) => { cover[k] = Math.fround(v / 255) * 2.0 - 1.0; });
@@ -490,12 +534,16 @@
     }
 
     const upscaled = bilinearResize(residual, 3, size, size, region.height, region.width);
-    return { data: applyResidual(image, region, upscaled, strength), width: image.width, height: image.height };
+    const data = applyResidual(image, region, upscaled, strength * config.strengthMultiplier);
+    return { data, width: image.width, height: image.height };
   }
 
   return {
     ENCODER_RESOLUTION,
     PACKET_BITS,
+    VARIANTS,
+    getVariant,
+    resolveEncodeOptions,
     processingRegion,
     rgbaToPlanar,
     computeScalesFixed,

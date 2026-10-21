@@ -85,7 +85,8 @@ test('decodeBits feeds the resized region to the decoder in [-1, 1] and threshol
   const queued = [];
   const run = (session, feeds) => { queued.push(session); return session.run(feeds); };
 
-  const bits = await core.decodeBits({ ort, resizer, run }, decoder, makeImage(600, 200), 224, true);
+  // Variant P: centre square, 224x224
+  const bits = await core.decodeBits({ ort, resizer, run }, decoder, makeImage(600, 200), 'P');
 
   assert.deepEqual(bits, Array.from({ length: 100 }, (_, i) => i % 3 === 0));
   assert.deepEqual(calls.map((c) => c.model), ['resizer', 'decoder']);
@@ -101,7 +102,45 @@ test('decodeBits feeds the resized region to the decoder in [-1, 1] and threshol
   assert.equal(Math.max(...calls[1].data.subarray(0, 256)), 1);
   assert.deepEqual(queued, [resizer, decoder], 'every inference goes through the runner');
 
-  await assert.rejects(core.decodeBits({ ort, resizer: null }, decoder, makeImage(4, 4), 256), /resizer model is not loaded/);
+  await assert.rejects(core.decodeBits({ ort, resizer: null }, decoder, makeImage(4, 4), 'Q'), /resizer model is not loaded/);
+  await assert.rejects(core.decodeBits({ ort, resizer, run }, decoder, makeImage(4, 4), 'X'), /Unknown TrustMark variant "X"; expected one of Q, P, B, C/);
+});
+
+test('decodeBits uses the resolution and crop of each variant', async () => {
+  const seen = [];
+  const resizer = {
+    async run(feeds) {
+      const size = Number(feeds.target_size.data[0]);
+      seen.push({ dims: feeds.X.dims, size });
+      return { Y: new Tensor('float32', new Float32Array(3 * size * size), [1, 3, size, size]) };
+    },
+  };
+  const decoder = { async run() { return { output: new Tensor('float32', new Float32Array(100), [1, 100]) }; } };
+  for (const variant of ['Q', 'B', 'C', 'P']) await core.decodeBits({ ort, resizer }, decoder, makeImage(500, 300), variant);
+  assert.deepEqual(seen, [
+    { dims: [1, 3, 300, 500], size: 256 },
+    { dims: [1, 3, 300, 500], size: 256 },
+    { dims: [1, 3, 300, 500], size: 256 },
+    { dims: [1, 3, 300, 300], size: 224 },
+  ]);
+});
+
+test('variant settings follow the Python implementation', () => {
+  assert.deepEqual(Object.keys(core.VARIANTS), ['Q', 'P', 'B', 'C']);
+  for (const [code, v] of Object.entries(core.VARIANTS)) {
+    assert.equal(v.code, code);
+    assert.equal(v.encoder, `encoder_${code}`);
+    assert.equal(v.decoder, `decoder_${code}`);
+    assert.equal(v.encodeResolution, 256);
+    assert.equal(v.decodeResolution, code === 'P' ? 224 : 256);
+    assert.equal(v.forceSquare, code === 'P');
+    assert.equal(v.strengthMultiplier, code === 'P' ? 1.25 : 1.0);
+    assert.ok(Object.isFrozen(v));
+  }
+  assert.equal(core.getVariant('C'), core.VARIANTS.C);
+  for (const bad of ['q', 'D', '', undefined, null, 0, 'constructor', 'toString']) {
+    assert.throws(() => core.getVariant(bad), /Unknown TrustMark variant/);
+  }
 });
 
 /** RGBA image with some texture: channel c of pixel (x, y) is (7x + 13y + 50c + 5((x * y) % 23)) % 256. */
@@ -260,6 +299,43 @@ test('encodeWatermark feeds the Pillow-resized region in [-1, 1] and keeps alpha
   }
 });
 
+test('encodeWatermark applies the crop and strength multiplier of the variant', async () => {
+  // An encoder that adds a pattern with a different mean per channel
+  const delta = (c, k) => ((k % 7) - 3) / 64 * (c + 1) + 0.05 * (c - 1);
+  const image = makeTexture(500, 300);
+  const packet = new Array(100).fill(1);
+  // TrustMark.encode: residual = clamp(stego, -1, 1) - cover in float32, minus its per-channel mean
+  const expected = (feeds, region, strength) => {
+    const cover = feeds['onnx::Concat_0'].data;
+    const plane = 256 * 256;
+    const residual = new Float32Array(3 * plane);
+    for (let c = 0; c < 3; c++) {
+      let sum = 0;
+      for (let k = 0; k < plane; k++) {
+        const stego = Math.fround(cover[c * plane + k] + delta(c, k));
+        residual[c * plane + k] = Math.min(1, Math.max(-1, stego)) - cover[c * plane + k];
+        sum += residual[c * plane + k];
+      }
+      for (let k = 0; k < plane; k++) residual[c * plane + k] -= sum / plane;
+    }
+    const upscaled = core.bilinearResize(residual, 3, 256, 256, region.height, region.width);
+    return core.applyResidual(image, region, upscaled, strength);
+  };
+
+  for (const [variant, square, multiplier] of [['Q', false, 1.0], ['B', false, 1.0], ['C', false, 1.0], ['P', true, 1.25]]) {
+    const feedsSeen = [];
+    const result = await core.encodeWatermark({ ort }, fakeEncoder(delta, feedsSeen), image, packet, { variant, strength: 0.8 });
+    const region = core.processingRegion(500, 300, square);
+    assert.deepEqual(region, square ? { left: 100, top: 0, width: 300, height: 300 } : { left: 0, top: 0, width: 500, height: 300 });
+    assertSameBytes(result.data, expected(feedsSeen[0], region, 0.8 * multiplier), variant);
+    // The encoder sees the Pillow resize of the region
+    const resized = core.pillowBilinearResize(image, region, 256, 256);
+    assert.ok(feedsSeen[0]['onnx::Concat_0'].data.every((v, k) => v === Math.fround(Math.fround(resized[k] / 255) * 2 - 1)), variant);
+    // P only changes the centre square
+    if (square) for (let x = 0; x < 100; x++) assert.equal(result.data[(150 * 500 + x) * 4], image.data[(150 * 500 + x) * 4]);
+  }
+});
+
 test('encodeWatermark rejects invalid input and missing models', async () => {
   const session = { run: async () => assert.fail('no model should run') };
   const runtime = { ort, resizer: session };
@@ -270,5 +346,14 @@ test('encodeWatermark rejects invalid input and missing models', async () => {
   await assert.rejects(core.encodeWatermark(runtime, session, image, packet.slice(1)), /100 bits/);
   await assert.rejects(core.encodeWatermark(runtime, session, image, [...packet.slice(1), 2]), /100 bits/);
   await assert.rejects(core.encodeWatermark(runtime, session, { data: new Uint8Array(10), width: 8, height: 8 }, packet), /RGBA data/);
-  await assert.rejects(core.encodeWatermark(runtime, session, image, packet, { strength: -1 }), /strength/);
+  await assert.rejects(core.encodeWatermark(runtime, session, image, packet, { strength: -1 }), /strength must be a non-negative number/);
+  await assert.rejects(core.encodeWatermark(runtime, session, image, packet, { strength: '1' }), /strength must be a non-negative number/);
+  await assert.rejects(core.encodeWatermark(runtime, session, image, packet, { variant: 'Z' }), /Unknown TrustMark variant "Z"/);
+});
+
+test('resolveEncodeOptions applies the defaults', () => {
+  assert.deepEqual(core.resolveEncodeOptions(), { variant: core.VARIANTS.Q, strength: 1.0 });
+  assert.deepEqual(core.resolveEncodeOptions({ variant: 'P', strength: 0 }), { variant: core.VARIANTS.P, strength: 0 });
+  assert.throws(() => core.resolveEncodeOptions({ strength: NaN }), /strength/);
+  assert.throws(() => core.resolveEncodeOptions({ strength: Infinity }), /strength/);
 });

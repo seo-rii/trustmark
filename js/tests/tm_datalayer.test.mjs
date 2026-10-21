@@ -157,3 +157,14 @@ test('rejects payloads that do not fit the schema', () => {
   assert.throws(encode('101', 4), /Invalid schema version 4/);
   assert.equal(dl.DataLayer_Encode('1'.repeat(61), 1, dl.eccengine).length, 100);
 });
+
+test('maps schema names and numbers to versions like TrustMark.Encoding', () => {
+  const dl = loadDataLayer();
+  SCHEMA_NAMES.forEach((name, version) => {
+    assert.equal(dl.DataLayer_GetSchemaVersion(name), version);
+    assert.equal(dl.DataLayer_GetSchemaVersion(version), version);
+  });
+  for (const bad of ['BCH_6', 'bch_5', '1', 4, -1, 1.5, null, undefined]) {
+    assert.throws(() => dl.DataLayer_GetSchemaVersion(bad), /Unknown watermark schema .*; expected BCH_SUPER, BCH_5, BCH_4, BCH_3 or 0 to 3/);
+  }
+});

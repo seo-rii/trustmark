@@ -10,16 +10,20 @@
 // Source for ONNX model binaries
 const MODEL_BASE_URL = "https://cai-watermark.adobe.net/watermarking/trustmark-models/";
 
-// List all watermark models for decoding
-const modelConfigs = [
-  { variantcode: 'Q', fname: 'decoder_Q', sessionVar: 'session_wmarkQ', resolution: 256, squarecrop: false }, 
-  { variantcode: 'P', fname: 'decoder_P', sessionVar: 'session_wmarkP', resolution: 224, squarecrop: true },
-];
+// Variants whose decoders are loaded by default, in the order they are tried. Each decoder
+// is a separate download: decoder_Q, decoder_P and decoder_B are 47 MB each, decoder_C 22 MB.
+// Choose others with trustmarkInit({ decoders }); the per-variant settings (resolution, crop)
+// are TrustmarkCore.VARIANTS.
+const DEFAULT_DECODERS = ['Q', 'P'];
+
+// Variants whose decoders were requested from trustmarkInit()
+let decoderVariants = [];
 
 // Backends tried, in order, for the decoders. If a WebGPU session cannot be created
 // (no adapter, unsupported operator, ...) the decoder falls back to WASM on the CPU.
 const DEFAULT_EXECUTION_PROVIDERS = ['webgpu', 'wasm'];
 
+// Sessions keyed by model name ('decoder_Q', 'encoder_P', ...)
 const sessions = {};
 let session_resize;
 
@@ -50,7 +54,11 @@ const trustmarkReady = new Promise((resolve) => { resolveTrustmarkReady = resolv
  * @param {Object} [options]
  * @param {string} [options.modelBaseUrl] - Base URL of the ONNX model files.
  * @param {Array<string>} [options.executionProviders] - Decoder and encoder backends to try, in order.
+ * @param {Array<string>} [options.decoders=['Q', 'P']] - Variants whose decoders runwmark uses,
+ *   in the order they are tried: any of 'Q', 'P', 'B' and 'C'. An empty list loads no decoder,
+ *   for pages that only embed watermarks.
  * @returns {Promise<Object>} Resolves with trustmarkStatus().
+ * @throws {Error} If `decoders` names an unknown variant (nothing is loaded then).
  */
 function trustmarkInit(options = {}) {
   if (trustmarkInitPromise) {
@@ -61,20 +69,26 @@ function trustmarkInit(options = {}) {
     return trustmarkInitPromise;
   }
 
+  const decoders = options.decoders === undefined ? DEFAULT_DECODERS : options.decoders;
+  if (!Array.isArray(decoders)) throw new Error('decoders must be an array of variant codes, e.g. [\'Q\', \'P\']');
+  decoders.forEach((code) => TrustmarkCore.getVariant(code));  // throws for an unknown variant
+  decoderVariants = [...new Set(decoders)];
+
   const baseUrl = options.modelBaseUrl || MODEL_BASE_URL;
   const executionProviders = options.executionProviders || DEFAULT_EXECUTION_PROVIDERS;
-  trustmarkOptions = { baseUrl, executionProviders };  // also used to load the encoder later
+  trustmarkOptions = { baseUrl, executionProviders };  // also used to load the encoders later
 
-  for (const name of ['resizer', ...modelConfigs.map((config) => config.fname)]) {
-    modelStates[name] = newModelState('pending');
-  }
+  const decoderNames = decoderVariants.map((code) => TrustmarkCore.getVariant(code).decoder);
+  // Only the decoders use the resizer model
+  const names = decoderNames.length ? ['resizer', ...decoderNames] : [];
+  for (const name of names) modelStates[name] = newModelState('pending');
 
   trustmarkInitPromise = (async () => {
     // The resizer must run on WASM: WebGPU's Resize does not support antialiasing
-    session_resize = await loadModelSession('resizer', baseUrl, ['wasm']);
-    for (const config of modelConfigs) {
-      const session = await loadModelSession(config.fname, baseUrl, executionProviders);
-      if (session) sessions[config.sessionVar] = session;
+    if (decoderNames.length) session_resize = await loadModelSession('resizer', baseUrl, ['wasm']);
+    for (const name of decoderNames) {
+      const session = await loadModelSession(name, baseUrl, executionProviders);
+      if (session) sessions[name] = session;
     }
     trustmarkLoaded = true;
     const status = trustmarkStatus();
@@ -255,6 +269,10 @@ async function runwmark(base64Image) {
   const decoders = [];
   let found = null;
 
+  if (!decoderVariants.length) {
+    return watermarkResult('error', null, decoders, 'no watermark decoders are loaded; pass trustmarkInit({ decoders })');
+  }
+
   let image;
   try {
     image = await loadImageData(base64Image);
@@ -263,32 +281,33 @@ async function runwmark(base64Image) {
     return watermarkResult('error', null, decoders, `could not read the image: ${errorMessage(error)}`);
   }
 
-  for (const config of modelConfigs) {
-    const outcome = { variant: config.variantcode, status: 'error', backend: null, error: null };
+  for (const variant of decoderVariants) {
+    const name = TrustmarkCore.getVariant(variant).decoder;
+    const outcome = { variant, status: 'error', backend: null, error: null };
     decoders.push(outcome);
 
-    const session = sessions[config.sessionVar];
+    const session = sessions[name];
     if (!session) {
-      outcome.error = modelNotLoadedError(config.fname).message;
+      outcome.error = modelNotLoadedError(name).message;
       continue;
     }
-    outcome.backend = modelStates[config.fname].backend;
+    outcome.backend = modelStates[name].backend;
 
     try {
       if (!session_resize) throw modelNotLoadedError('resizer');
 
       let startTime = new Date();
-      const watermarkBool = await TrustmarkCore.decodeBits(coreRuntime(), session, image, config.resolution, config.squarecrop);
+      const watermarkBool = await TrustmarkCore.decodeBits(coreRuntime(), session, image, variant);
 
-      const dataObj = DataLayer_Decode(watermarkBool, eccengine, config.variantcode);
+      const dataObj = DataLayer_Decode(watermarkBool, eccengine, variant);
       console.log(`Watermark model inference in ${(new Date() - startTime)} milliseconds`);
 
       outcome.status = dataObj.valid ? 'detected' : 'not_detected';
       // Report the first detected watermark (if many were)
       if (dataObj.valid && !found) found = { dataObj, outcome };
     } catch (error) {
-      console.error(`Error in ${config.fname} watermark decoding:`, error);
-      outcome.error = `${config.fname}: ${errorMessage(error)}`;
+      console.error(`Error in ${name} watermark decoding:`, error);
+      outcome.error = `${name}: ${errorMessage(error)}`;
     }
   }
 
@@ -322,58 +341,67 @@ function watermarkResult(status, found, decoders, error) {
   };
 }
 
-// Watermark embedding (variant Q, schema BCH_5 only). The encoder model is only
-// downloaded when the first image is watermarked.
-const encoderConfig = { variantcode: 'Q', fname: 'encoder_Q', schema: 1 };
-let session_encoder = null;
-let encoderLoadPromise = null;
+// Watermark embedding. Each encoder model (17 MB) is only downloaded when the first image is
+// watermarked with its variant.
+const encoderLoads = {};
 
 /**
- * Loads the encoder model once, after the models of trustmarkInit().
+ * Loads the encoder model of a variant once, after the models of trustmarkInit().
+ * @param {string} variant - Variant code.
  * @returns {Promise<ort.InferenceSession|null>} The session, or null if it failed to load.
  */
-function loadEncoder() {
-  if (!encoderLoadPromise) {
-    encoderLoadPromise = trustmarkInit().then(async () => {
-      session_encoder = await loadModelSession(encoderConfig.fname, trustmarkOptions.baseUrl, trustmarkOptions.executionProviders);
-      return session_encoder;
+function loadEncoder(variant) {
+  const name = TrustmarkCore.getVariant(variant).encoder;
+  if (!encoderLoads[name]) {
+    modelStates[name] = newModelState('pending');
+    encoderLoads[name] = trustmarkInit().then(async () => {
+      const session = await loadModelSession(name, trustmarkOptions.baseUrl, trustmarkOptions.executionProviders);
+      if (session) sessions[name] = session;
+      return session;
     });
   }
-  return encoderLoadPromise;
+  return encoderLoads[name];
 }
 
 /**
- * Embeds a TrustMark watermark (variant Q, schema BCH_5) into an image, like
- * TrustMark.encode in the Python implementation with the default strength of 1.0.
- * The alpha channel is kept. Rejects, rather than returning an unwatermarked image,
- * if the payload is invalid, the image cannot be read or a model is unavailable.
+ * Embeds a TrustMark watermark into an image, like TrustMark.encode in the Python implementation
+ * (MODE='binary'). The alpha channel is kept. Rejects, rather than returning an unwatermarked
+ * image, if an option or the payload is invalid, the image cannot be read or the model is
+ * unavailable; invalid options and payloads are rejected before anything is downloaded.
  *
  * @param {string|Blob|ImageData} image - Image URL, File/Blob, or RGBA ImageData.
- * @param {string} payload - Up to 61 '0'/'1' characters; shorter payloads are padded with zeros.
+ * @param {string} payload - '0'/'1' characters, at most the capacity of the schema (BCH_SUPER 40,
+ *   BCH_5 61, BCH_4 68, BCH_3 75 bits); shorter payloads are padded with zeros.
  * @param {Object} [options]
- * @param {number} [options.strength=1.0] - Watermark strength.
- * @returns {Promise<Object>} { image: { data, width, height } (RGBA), payload (the 61 embedded
- *   bits), packet (the 100 bits fed to the encoder), schema, variant, backend }.
+ * @param {string} [options.variant='Q'] - Model variant: 'Q', 'P', 'B' or 'C'.
+ * @param {string|number} [options.schema='BCH_5'] - Error correction schema: 'BCH_SUPER', 'BCH_5',
+ *   'BCH_4' or 'BCH_3', or its number (0 to 3, as TrustMark.Encoding in Python).
+ * @param {number} [options.strength=1.0] - Watermark strength (variant P multiplies it by 1.25).
+ * @returns {Promise<Object>} { image: { data, width, height } (RGBA), payload (the embedded data
+ *   bits), packet (the 100 bits fed to the encoder), schema (its name), variant, backend }.
  */
 async function trustmarkEncode(image, payload, options = {}) {
-  // Validate the payload before downloading anything
-  const packet = DataLayer_Encode(payload, encoderConfig.schema, eccengine);
+  // Validate everything before downloading anything
+  const { variant, strength } = TrustmarkCore.resolveEncodeOptions(options);
+  const schema = DataLayer_GetSchemaVersion(options.schema === undefined ? 'BCH_5' : options.schema);
+  const packet = DataLayer_Encode(payload, schema, eccengine);
+  const name = variant.encoder;
 
-  const encoder = await loadEncoder();
-  if (!encoder) throw modelNotLoadedError(encoderConfig.fname);
+  const encoder = await loadEncoder(variant.code);
+  if (!encoder) throw modelNotLoadedError(name);
 
   const pixels = await loadImageData(image);
   const startTime = Date.now();
-  const watermarked = await TrustmarkCore.encodeWatermark(coreRuntime(), encoder, pixels, packet, options);
+  const watermarked = await TrustmarkCore.encodeWatermark(coreRuntime(), encoder, pixels, packet, { variant: variant.code, strength });
   console.log(`Watermark embedded in ${Date.now() - startTime} milliseconds`);
 
   return {
     image: watermarked,
-    payload: payload.padEnd(DataLayer_GetSchemaDataBits(encoderConfig.schema), '0'),
+    payload: payload.padEnd(DataLayer_GetSchemaDataBits(schema), '0'),
     packet: packet.join(''),
-    schema: DataLayer_GetSchemaName(encoderConfig.schema),
-    variant: encoderConfig.variantcode,
-    backend: modelStates[encoderConfig.fname].backend,
+    schema: DataLayer_GetSchemaName(schema),
+    variant: variant.code,
+    backend: modelStates[name].backend,
   };
 }
 
