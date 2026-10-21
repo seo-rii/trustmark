@@ -8,5 +8,6 @@
 
 const { createTrustmark, capabilities } = require('./lib/trustmark');
 const { TrustmarkError } = require('./lib/errors');
+const { encodeVerified, WatermarkVerificationError } = require('./lib/verified');
 
-module.exports = { createTrustmark, capabilities, TrustmarkError };
+module.exports = { createTrustmark, capabilities, encodeVerified, TrustmarkError, WatermarkVerificationError };

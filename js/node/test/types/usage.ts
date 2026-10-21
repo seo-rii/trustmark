@@ -1,7 +1,7 @@
 // Compile-only checks of index.d.ts (run by types.test.mjs with tsc --noEmit). The lines after
 // each expect-error directive at the end must fail to type-check.
-import { capabilities, createTrustmark, TrustmarkError } from '../..';
-import type { DecodeResult, EncodeResult, Schema, Trustmark, TrustmarkErrorCode } from '../..';
+import { capabilities, createTrustmark, encodeVerified, TrustmarkError, WatermarkVerificationError } from '../..';
+import type { DecodeResult, EncodeResult, Schema, Trustmark, TrustmarkErrorCode, VerifiedEncodeResult } from '../..';
 
 async function main(): Promise<void> {
   const tm: Trustmark = createTrustmark({
@@ -36,6 +36,18 @@ async function main(): Promise<void> {
     const nothing: null = decoded.payload;
     void nothing;
   }
+  try {
+    const verified: VerifiedEncodeResult = await encodeVerified(tm, bytes, '0101', { format: 'jpeg', quality: 85, retryStrengths: [1.5, 2], verifier: tm, signal: AbortSignal.timeout(1000) });
+    const digest: string = verified.sha256;
+    const attempts: number = verified.verification.attempts.length;
+    void digest; void attempts;
+  } catch (error) {
+    if (error instanceof WatermarkVerificationError) {
+      const reason: 'not_detected' | 'payload_mismatch' | 'schema_mismatch' | 'decode_error' | 'bytes_changed' = error.reason;
+      const code: 'VERIFICATION_FAILED' = error.code;
+      void reason; void code;
+    }
+  }
   const status = await tm.ready();
   const backend: string | null = status.models.encoder.backend;
   const canEmbedP: boolean | undefined = capabilities().variants.P?.encode;
@@ -58,6 +70,8 @@ async function main(): Promise<void> {
   await tm.encode(bytes, '1', { format: 'webp' });
   // @ts-expect-error file paths are not accepted
   await tm.decode('/tmp/image.png');
+  // @ts-expect-error retry strengths are numbers
+  await encodeVerified(tm, bytes, '1', { retryStrengths: ['2'] });
   // @ts-expect-error a not_detected result has no payload string
   if (decoded.status === 'not_detected') { const p: string = decoded.payload; void p; }
 }

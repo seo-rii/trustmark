@@ -123,6 +123,49 @@ and 8.7% for `BCH_3`):
 
 A detection is evidence, not proof: compare the payload with the payloads you issued.
 
+### `encodeVerified(trustmark, input, payload, options?)`
+
+For pipelines that must never release an image without a readable watermark. It embeds the
+payload, encodes the final format and quality, decodes those exact bytes again and resolves only
+when the payload and the schema read back exactly. The result is the `encode` result plus
+`sha256` (of `bytes`) and `verification` (`payload`, `schema`, `bitFlips`, `backend` and every
+attempt). Otherwise it rejects with a `WatermarkVerificationError` (code `VERIFICATION_FAILED`)
+whose `reason` is `not_detected`, `payload_mismatch`, `schema_mismatch`, `decode_error` or
+`bytes_changed` (a custom verifier modified the bytes), and whose `attempts` describe each try. It never returns the input or bytes that failed, and the
+error carries no image bytes.
+
+- The check uses the `'signalled'` schema policy, so the version bits must also be intact, as the
+  Python decoder requires.
+- `options.retryStrengths`, e.g. `[1.5, 2]`, are higher strengths to try, in order, when the
+  watermark is not read back. There are no retries by default, and a decoder error is not
+  retried. With the Q models, `ufo_240.jpg` saved as JPEG at quality 20 passed at strength 1,
+  at quality 15 it needed strength 2, and at quality 10 or less nothing up to strength 3 passed.
+- `options.verifier` decodes with another object that has `decode()`, for example a second
+  instance on a different execution provider. By default the same instance is used.
+- `format`, `quality`, `background`, `strength` (first attempt) and `signal` are as for `encode`.
+  Encode errors and aborts reject as they do for `encode`.
+
+This is the reusable, policy-free part of a release gate. Which images may be published, by
+whom, and where, belongs to the service that calls it.
+[`examples/verified-release/release.mjs`](examples/verified-release/release.mjs) shows one way to
+use it: the generated image stays in a private directory, `encodeVerified` produces the verified
+bytes, which are staged privately and published into a public directory with an atomic,
+no-clobber hard link; a JSON record per job id tracks `generated`, `verified`, `released` or
+`failed`, and a released job id is not processed again. No failure leaves a file in the public
+directory. `examples/verified-release/demo.mjs` runs it from the command line.
+
+What this does not guarantee:
+
+- It is not authentication or proof of origin. Anyone with the public models can read a payload,
+  and a watermark can be removed or copied onto another image. Use signed C2PA manifests for
+  provenance, and treat the payload as a lookup key.
+- The storage or gateway is the enforcement point: serve only the public directory, deny access
+  to the private one, and make sure nothing else writes to the public directory.
+- Job ids and payloads are not secrets.
+- Verification uses this SDK's decoder on the final bytes. Other decoders can differ on marginal
+  JPEGs, and later resizing or recompression can remove the watermark.
+- It is not a legal or regulatory compliance guarantee.
+
 ### `ready(options?)`, `status()`, `close()`
 
 `ready()` loads the models now (useful at startup, so that a missing model fails fast) and
@@ -157,6 +200,7 @@ reason (an `AbortError` or `TimeoutError` `DOMException` by default):
 | `MODEL_LOAD_FAILED` | No execution provider could create a session; `details.fallbacks` has the reasons. |
 | `INFERENCE_FAILED` | A model failed while running. |
 | `QUEUE_FULL`, `CLOSED` | See `maxQueue` and `close()`. |
+| `VERIFICATION_FAILED` | `encodeVerified` could not read the watermark back (`WatermarkVerificationError`). |
 
 ## Models
 

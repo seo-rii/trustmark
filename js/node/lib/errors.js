@@ -16,6 +16,7 @@
  *   INFERENCE_FAILED       a model failed while running
  *   QUEUE_FULL             too many jobs are waiting (maxQueue)
  *   CLOSED                 the instance was closed
+ *   VERIFICATION_FAILED    encodeVerified could not read the watermark back (WatermarkVerificationError)
  */
 class TrustmarkError extends Error {
   constructor(code, message, options = {}) {
