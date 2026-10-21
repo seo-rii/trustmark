@@ -65,18 +65,20 @@ test('extracts a region as planar RGB in [0, 1] and ignores alpha', () => {
   }
 });
 
-test('decodeBits feeds the resized region to the decoder and thresholds its output', async () => {
+test('decodeBits feeds the resized region to the decoder in [-1, 1] and thresholds its output', async () => {
   const calls = [];
+  // Resized pixels covering [0, 1]
+  const resized = (size) => Float32Array.from({ length: 3 * size * size }, (_, i) => (i % 256) / 255);
   const resizer = {
     async run(feeds) {
       calls.push({ model: 'resizer', dims: feeds.X.dims, size: Number(feeds.target_size.data[0]), scales: Array.from(feeds.scales.data) });
       const size = Number(feeds.target_size.data[0]);
-      return { Y: new Tensor('float32', new Float32Array(3 * size * size).fill(0.5), [1, 3, size, size]) };
+      return { Y: new Tensor('float32', resized(size), [1, 3, size, size]) };
     },
   };
   const decoder = {
     async run(feeds) {
-      calls.push({ model: 'decoder', dims: feeds.image.dims });
+      calls.push({ model: 'decoder', dims: feeds.image.dims, data: feeds.image.data });
       return { output: new Tensor('float32', Float32Array.from({ length: 100 }, (_, i) => (i % 3 === 0 ? 0.5 : -0.5)), [1, 100]) };
     },
   };
@@ -91,6 +93,12 @@ test('decodeBits feeds the resized region to the decoder and thresholds its outp
   assert.equal(calls[0].size, 224);
   assert.equal(Math.floor(200 * calls[0].scales[2]), 224);
   assert.deepEqual(calls[1].dims, [1, 3, 224, 224]);
+  // The decoders take [-1, 1] like the Python and Rust decoders (ToTensor() * 2 - 1)
+  const expected = resized(224);
+  assert.ok(calls[1].data instanceof Float32Array);
+  calls[1].data.forEach((v, i) => assert.equal(v, Math.fround(expected[i] * 2 - 1), `decoder input [${i}]`));
+  assert.equal(Math.min(...calls[1].data.subarray(0, 256)), -1);
+  assert.equal(Math.max(...calls[1].data.subarray(0, 256)), 1);
   assert.deepEqual(queued, [resizer, decoder], 'every inference goes through the runner');
 
   await assert.rejects(core.decodeBits({ ort, resizer: null }, decoder, makeImage(4, 4), 256), /resizer model is not loaded/);
