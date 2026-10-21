@@ -357,3 +357,13 @@ test('resolveEncodeOptions applies the defaults', () => {
   assert.throws(() => core.resolveEncodeOptions({ strength: NaN }), /strength/);
   assert.throws(() => core.resolveEncodeOptions({ strength: Infinity }), /strength/);
 });
+
+test('applyResidual upscales a small residual exactly like bilinearResize', () => {
+  const residual = Float32Array.from({ length: 3 * 256 * 256 }, (_, i) => (((i * 37) % 65) - 32) / 1024);
+  for (const [width, height, square] of [[240, 240, false], [257, 255, false], [1001, 333, false], [61, 37, true]]) {
+    const image = makeTexture(width, height);
+    const region = core.processingRegion(width, height, square);
+    const reference = core.applyResidual(image, region, core.bilinearResize(residual, 3, 256, 256, region.height, region.width), 1.25);
+    assertSameBytes(core.applyResidual(image, region, residual, 1.25, 256, 256), reference, `${width}x${height}`);
+  }
+});

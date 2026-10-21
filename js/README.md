@@ -117,6 +117,11 @@ Limitations:
 - Like the Python implementation, small regions and payloads that are mostly zeros can be hard to decode, especially with variant P and the `BCH_4` and `BCH_3` schemas, which correct fewer errors.
 - In the browser, images go through a canvas: colour profiles are applied when the image is read, the canvas stores premultiplied alpha (so fully transparent pixels lose their colour, and semi-transparent pixels can shift slightly), and the downloaded PNG is RGBA without the original metadata. `tm_core.js` itself works on the exact RGBA values it is given.
 
+## Performance
+
+- **Embedding works on the 256x256 residual.** The residual is upscaled to the image size while it is added, instead of in a separate full-size copy (110 MB of floats for a 9-megapixel image). For a 4032x2268 image, the residual paste takes 215 ms instead of 445 ms, and the 256x256 downscale 72 ms instead of 82 ms (Node.js 24, median of 9). The output is unchanged, byte for byte.
+- Encoding the result as PNG in the browser (`imageToPngBlob`) takes about 270 ms for a 4032x2268 image in Chromium.
+
 ## Run the example
 
 To run the example:
