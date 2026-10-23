@@ -139,7 +139,7 @@ pub(super) fn apply_residual(input: DynamicImage, residual: DynamicImage) -> Dyn
 
         for (pixel, residual) in samples
             .chunks_exact_mut(channels)
-            .zip(residual.chunks_exact(3))
+            .zip(residual.as_chunks::<3>().0)
         {
             for (x, &y) in pixel.iter_mut().zip(residual) {
                 let sum = convert_from_0_1_to_neg1_1!(*x) + convert_from_0_1_to_neg1_1!(y);
