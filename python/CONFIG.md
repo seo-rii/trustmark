@@ -30,7 +30,7 @@ In general, we recommend using **P** or **Q**:
 ## Watermark strength
 
 Set the optional `WM_STRENGTH` parameter when encoding (at runtime).
-Its default value is `1.0`, and changing it provides a trade-off between **robustness** and **visibility**:
+Its default value is `1.0` (it must be a finite number of at least `0`), and changing it provides a trade-off between **robustness** and **visibility**:
 
 - Raising its value (for example, to 1.5) improves robustness (so, for example, the watermark survives printing) but increases the likelihood of ripple artifacts.  
 - Lowering its value (for example, to 0.8) reduces any likelihood of artifacts but compromises on robustness; however it still survives lower noise, screenshotting, or social media.
@@ -91,7 +91,7 @@ Visual quality is often measured via **PSNR** (Peak Signal-to-Noise Ratio), but 
 
 Some derivative works have tried to improve PSNR by "zero padding" or concentrating the watermark into only the central region, effectively altering fewer pixels and artificially raising the PSNR score. However, this approach **can increase human-visible artifacts** in the concentrated area.
 
-**Parameter:** CONCENTRATE_WM_REGION  
+**Parameter:** CONCENTRATE_WM_REGION (constructor argument `concentrate_wm_region`, a finite number in `(0, 1]`)  
 - Default is 100% (no zero padding).  
 - If you set, for example, 80% zero padding, you might inflate PSNR by ~5 dB.  
 - At 50% zero padding, PSNR might inflate by ~10 dB.  
