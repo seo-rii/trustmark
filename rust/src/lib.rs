@@ -265,13 +265,13 @@ impl Trustmark {
         strength: f32,
     ) -> Result<DynamicImage, Error> {
         let (original_width, original_height) = img.dimensions();
-        let aspect_ratio = original_width as f32 / original_height as f32;
 
         // the image is always encoded with size 256x256
         let encode_size = 256;
 
-        let input_img: Value<TensorValueType<f32>> =
-            ModelImage(encode_size, self.variant, img.clone()).try_into()?;
+        // Preprocess by reference: the image itself is still needed to apply the residual.
+        let model_img = ModelImage(encode_size, self.variant, img);
+        let input_img: Value<TensorValueType<f32>> = (&model_img).try_into()?;
         // before the payload is checked against `self.version`, which decoder-only models lack
         let encoder = self.encoder.as_ref().ok_or(Error::EncoderNotLoaded)?;
         let bits: Value<TensorValueType<f32>> =
@@ -279,23 +279,21 @@ impl Trustmark {
         let output_img = {
             let mut encoder = encoder.lock().map_err(|_| Error::SessionLockPoisoned)?;
             let outputs = encoder.run(ort::inputs![
-                "onnx::Concat_0" => input_img,
+                "onnx::Concat_0" => &input_img,
                 "onnx::Gemm_1" => bits,
             ])?;
             outputs["image"].try_extract_array::<f32>()?.to_owned()
         };
 
-        // Need to calculate and apply the residual.
-        let input_img: Value<TensorValueType<f32>> =
-            ModelImage(encode_size, self.variant, img.clone()).try_into()?;
+        // Need to calculate and apply the residual, reusing the input tensor the encoder saw.
         let residual = (self.variant.strength_multiplier() * strength)
             * (output_img - input_img.try_extract_array::<f32>()?);
 
         // Residual should be small perturbations.
         let mut residual = residual.clamp(-0.2, 0.2);
-        if (self.variant == Variant::Q && !(0.5..=2.0).contains(&aspect_ratio))
-            || self.variant == Variant::P
-        {
+        // The residual only covers the center-cropped square the model saw, so pad it back out to
+        // the full image instead of stretching it.
+        if image_processing::is_center_cropped(self.variant, (original_width, original_height)) {
             residual = image_processing::remove_boundary_artifact(
                 residual,
                 (original_width as usize, original_height as usize),
@@ -304,6 +302,7 @@ impl Trustmark {
         }
 
         let ModelImage(_, _, residual) = (encode_size, self.variant, residual).try_into()?;
+        let ModelImage(_, _, img) = model_img;
 
         Ok(image_processing::apply_residual(img, residual))
     }
@@ -418,9 +417,8 @@ mod tests {
         assert_eq!(watermark, decoded);
     }
 
-    fn roundtrip(path: impl AsRef<Path>) {
-        let tm = Trustmark::new("./models", Variant::Q, Version::Bch5).unwrap();
-        let input = image::open(path.as_ref()).unwrap();
+    fn roundtrip(variant: Variant, input: DynamicImage) {
+        let tm = Trustmark::new("./models", variant, Version::Bch5).unwrap();
         let watermark = "1011011110011000111111000000011111011111011100000110110110111".to_owned();
         let encoded = tm.encode(watermark.clone(), input, 0.95).unwrap();
         let mut png = std::io::Cursor::new(Vec::new());
@@ -434,12 +432,31 @@ mod tests {
 
     #[test]
     fn roundtrip_ghost() {
-        roundtrip("../images/ghost.png");
+        roundtrip(Variant::Q, image::open("../images/ghost.png").unwrap());
     }
 
     #[test]
     fn roundtrip_ufo() {
-        roundtrip("../images/ufo_240.jpg");
+        roundtrip(Variant::Q, image::open("../images/ufo_240.jpg").unwrap());
+    }
+
+    /// A 512x240 strip of the ghost image, which is wider than 2:1 and therefore center-cropped.
+    fn wide_ghost() -> DynamicImage {
+        image::open("../images/ghost.png")
+            .unwrap()
+            .crop_imm(0, 136, 512, 240)
+    }
+
+    #[test]
+    fn roundtrip_wide_and_tall_b() {
+        roundtrip(Variant::B, wide_ghost());
+        roundtrip(Variant::B, wide_ghost().rotate90());
+    }
+
+    #[test]
+    fn roundtrip_wide_and_tall_c() {
+        roundtrip(Variant::C, wide_ghost());
+        roundtrip(Variant::C, wide_ghost().rotate90());
     }
 
     #[test]
