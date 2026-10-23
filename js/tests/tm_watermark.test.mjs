@@ -284,6 +284,56 @@ test('inferences run one at a time in FIFO order, and a failure does not stall t
 
 const rgbaImage = (width, height) => ({ data: new Uint8ClampedArray(width * height * 4).fill(200), width, height });
 
+test('the demo does not report a pending encoder as failed when embedding during startup', async () => {
+  const gate = deferred();
+  const tm = loadWatermark({ ort: fakeOrt(), fetch: fakeFetch({ gate: gate.promise }), autoInit: false });
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) {
+      const classes = new Set();
+      const listeners = new Map();
+      elements.set(id, {
+        textContent: '', value: '', style: {}, disabled: false, files: [],
+        classList: {
+          add: (name) => classes.add(name),
+          remove: (name) => classes.delete(name),
+          toggle: (name, enabled) => enabled ? classes.add(name) : classes.delete(name),
+          contains: (name) => classes.has(name),
+        },
+        addEventListener: (name, listener) => listeners.set(name, listener),
+        click: () => listeners.get('click')(),
+      });
+    }
+    return elements.get(id);
+  };
+  element('encode-schema').value = 'BCH_5';
+  element('encode-variant').value = 'Q';
+  element('encode-file').files = [{ name: 'cover.png', ...rgbaImage(8, 8) }];
+  Object.assign(tm.context, {
+    document: { getElementById: element, querySelector: element, body: element('body') },
+    location: { search: '' }, URLSearchParams,
+    crypto: { getRandomValues: (bytes) => bytes.fill(1) },
+    URL: { createObjectURL: () => 'blob:watermarked', revokeObjectURL() {} },
+    imageToPngBlob: async () => ({}),
+  });
+  const html = fs.readFileSync(path.join(jsDir, 'index.html'), 'utf8');
+  const script = Array.from(html.matchAll(/<script>([\s\S]*?)<\/script>/g)).at(-1)[1];
+  vm.runInContext(script, tm.context, { filename: 'index.html' });
+
+  assert.equal(element('encode-btn').disabled, false);
+  const embedding = element('encode-btn').click();
+  assert.equal(tm.get('trustmarkStatus')().loaded, false);
+  gate.resolve();
+  const ready = await tm.get('trustmarkReady');
+  await embedding;
+
+  assert.match(element('encode-output').textContent, /^Embedded BCH_5 payload/);
+  assert.equal(tm.get('trustmarkStatus')().models.encoder_Q.status, 'ready');
+  assert.doesNotMatch(element('model-status').textContent, /FAILED/);
+  assert.equal(element('model-status').classList.contains('error'), false);
+  assert.deepEqual(plain(Object.keys(ready.models).sort()), ['decoder_P', 'decoder_Q', 'resizer']);
+});
+
 test('trustmarkEncode embeds the BCH_5 packet and records the encoder backend', async () => {
   const ort = fakeOrt({ failCreate: (name, backend) => (backend === 'webgpu' ? 'no available backend found' : null) });
   const tm = loadWatermark({ ort, fetch: fakeFetch() });
