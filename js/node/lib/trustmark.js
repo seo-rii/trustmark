@@ -306,6 +306,7 @@ function createTrustmark(options = {}) {
     if (opts === null || typeof opts !== 'object') throw argumentError('ready options must be an object');
     const signal = checkSignal(opts.signal);
     ensureOpen();
+    throwIfAborted(signal);
     await raceAbort(Promise.all(Object.keys(roles).map(load)), signal);
     return status();
   }
