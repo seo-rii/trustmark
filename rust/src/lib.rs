@@ -45,7 +45,7 @@ use std::{path::Path, sync::Mutex};
 
 use image::{DynamicImage, GenericImageView as _};
 use ort::{
-    session::{builder::GraphOptimizationLevel, Session},
+    session::Session,
     value::{TensorValueType, Value},
 };
 
@@ -54,11 +54,14 @@ use self::{bits::Bits, image_processing::ModelImage};
 mod bits;
 mod image_processing;
 mod model;
+mod session;
 
 /// A loaded Trustmark model.
 pub struct Trustmark {
     encoder: Mutex<Session>,
     decoder: Mutex<Session>,
+    encoder_provider: ProviderInfo,
+    decoder_provider: ProviderInfo,
     version: Version,
     variant: Variant,
 }
@@ -77,6 +80,13 @@ pub enum Error {
     InvalidModelVariant,
     #[error("ONNX session lock is poisoned")]
     SessionLockPoisoned,
+    /// The requested execution provider could not be used, and [`SessionOptions::fallback`] is
+    /// [`ProviderFallback::Error`].
+    #[error("could not use the {provider} execution provider: {source}")]
+    ExecutionProvider {
+        provider: ExecutionProvider,
+        source: ort::Error,
+    },
 }
 
 impl From<bits::Error> for Error {
@@ -90,19 +100,39 @@ impl From<bits::Error> for Error {
 
 pub use bits::Version;
 pub use model::Variant;
+pub use session::{ExecutionProvider, ProviderFallback, ProviderInfo};
 
-/// ONNX Runtime threading for the encoder and decoder sessions.
+/// ONNX Runtime threading and execution provider for the encoder and decoder sessions.
 ///
-/// The default keeps the behaviour of [`Trustmark::new`]: 8 intra-op threads per session and the
-/// runtime's default spinning. A host that runs several models side by side (one per worker
-/// thread, for example) sets `intra_threads` to its own budget and usually turns spinning off,
-/// so idle sessions do not burn CPU.
+/// The default keeps the behaviour of [`Trustmark::new`]: 8 intra-op threads per session, the
+/// runtime's default spinning, and the CPU execution provider. A host that runs several models
+/// side by side (one per worker thread, for example) sets `intra_threads` to its own budget and
+/// usually turns spinning off, so idle sessions do not burn CPU.
+///
+/// ```no_run
+/// use trustmark::{ExecutionProvider, ProviderFallback, SessionOptions, Trustmark, Variant, Version};
+///
+/// // Needs the `cuda` feature; uses the CPU if the GPU cannot be used.
+/// let options = SessionOptions {
+///     execution_provider: ExecutionProvider::Cuda { device_id: 0 },
+///     fallback: ProviderFallback::Cpu,
+///     ..SessionOptions::default()
+/// };
+/// let tm = Trustmark::with_options("./models", Variant::Q, Version::Bch5, options).unwrap();
+/// if let Some(reason) = &tm.decoder_provider().fallback_reason {
+///     eprintln!("decoding on the CPU: {reason}");
+/// }
+/// ```
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SessionOptions {
     /// Intra-op threads of each session (the encoder and the decoder each get this many).
     pub intra_threads: usize,
     /// Whether intra-op threads spin while waiting for work; `None` keeps the runtime default.
     pub intra_op_spinning: Option<bool>,
+    /// The hardware backend of both sessions. Defaults to the CPU.
+    pub execution_provider: ExecutionProvider,
+    /// What to do if `execution_provider` cannot be used. Defaults to returning an error.
+    pub fallback: ProviderFallback,
 }
 
 impl Default for SessionOptions {
@@ -110,6 +140,8 @@ impl Default for SessionOptions {
         Self {
             intra_threads: 8,
             intra_op_spinning: None,
+            execution_provider: ExecutionProvider::Cpu,
+            fallback: ProviderFallback::Error,
         }
     }
 }
@@ -124,30 +156,40 @@ impl Trustmark {
         Self::with_options(models, variant, version, SessionOptions::default())
     }
 
-    /// Load a Trustmark model with explicit ONNX Runtime threading.
+    /// Load a Trustmark model with explicit ONNX Runtime threading and execution provider.
+    ///
+    /// Fails with [`Error::ExecutionProvider`] if `options.execution_provider` cannot be used and
+    /// `options.fallback` is [`ProviderFallback::Error`]. With [`ProviderFallback::Cpu`], check
+    /// [`Trustmark::encoder_provider`] and [`Trustmark::decoder_provider`] to see which provider
+    /// each session ended up with.
     pub fn with_options<P: AsRef<Path>>(
         models: P,
         variant: Variant,
         version: Version,
         options: SessionOptions,
     ) -> Result<Self, Error> {
-        let session = |file: String| -> Result<Session, Error> {
-            let mut builder = Session::builder()?
-                .with_optimization_level(GraphOptimizationLevel::Level3)?
-                .with_intra_threads(options.intra_threads)?;
-            if let Some(spinning) = options.intra_op_spinning {
-                builder = builder.with_intra_op_spinning(spinning)?;
-            }
-            Ok(builder.commit_from_file(models.as_ref().join(file))?)
-        };
-        let encoder = session(variant.encoder_filename())?;
-        let decoder = session(variant.decoder_filename())?;
+        let (encoder, encoder_provider) =
+            session::load(&models.as_ref().join(variant.encoder_filename()), &options)?;
+        let (decoder, decoder_provider) =
+            session::load(&models.as_ref().join(variant.decoder_filename()), &options)?;
         Ok(Self {
             encoder: Mutex::new(encoder),
             decoder: Mutex::new(decoder),
+            encoder_provider,
+            decoder_provider,
             version,
             variant,
         })
+    }
+
+    /// The execution provider requested for the encoder session and the one it was created with.
+    pub fn encoder_provider(&self) -> &ProviderInfo {
+        &self.encoder_provider
+    }
+
+    /// The execution provider requested for the decoder session and the one it was created with.
+    pub fn decoder_provider(&self) -> &ProviderInfo {
+        &self.decoder_provider
     }
 
     /// Encode a watermark into an image.
@@ -242,6 +284,7 @@ mod tests {
         let options = SessionOptions {
             intra_threads: 1,
             intra_op_spinning: Some(false),
+            ..SessionOptions::default()
         };
         let tm = Trustmark::with_options("./models", Variant::Q, Version::Bch5, options).unwrap();
         let input = image::open("../images/ghost.png").unwrap();
