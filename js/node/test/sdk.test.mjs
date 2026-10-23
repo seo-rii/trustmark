@@ -2,10 +2,11 @@
 // queue, AbortSignal and close(). No models or network needed. Run from js/node with: npm test
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import test from 'node:test';
 
-import { PACKET, PAYLOAD, deferred, fakeModelDir, fakeOrt, rgbaImage, tick } from './helpers.mjs';
+import { PACKET, PAYLOAD, deferred, fakeModelDir, fakeOrt, rgbaImage, tempDir, tick } from './helpers.mjs';
 
 const require = createRequire(import.meta.url);
 const { createTrustmark, capabilities, TrustmarkError } = require('..');
@@ -270,6 +271,37 @@ test('an already aborted signal and AbortSignal.timeout reject', async (t) => {
   const { tm } = setup(t, { fake: { hook: () => new Promise((resolve) => setTimeout(resolve, 200)) } });
   await assert.rejects(tm.encode(PNG_INPUT, '1', { signal: AbortSignal.abort() }), { name: 'AbortError' });
   await assert.rejects(tm.decode(PNG_INPUT, { signal: AbortSignal.timeout(20) }), { name: 'TimeoutError' });
+});
+
+test('ready rejects an already aborted signal before loading models', async (t) => {
+  const { tm, log } = setup(t);
+  const reason = new Error('cancelled before loading');
+  await assert.rejects(tm.ready({ signal: AbortSignal.abort(reason) }), (error) => error === reason);
+  const afterAbort = tm.status();
+  const createdAfterAbort = log.created.length;
+
+  // Cancelling this call does not prevent a later caller from loading the models.
+  const ready = await tm.ready();
+  assert.deepEqual(Object.values(afterAbort.models).map((model) => model.status), ['idle', 'idle', 'idle']);
+  assert.equal(createdAfterAbort, 0);
+  assert.ok(Object.values(ready.models).every((model) => model.status === 'ready'));
+  assert.equal(log.created.length, 3);
+});
+
+test('an aborted ready with missing models does not crash the process', (t) => {
+  const child = spawnSync(process.execPath, ['--unhandled-rejections=strict', '-e', `
+    const assert = require('node:assert/strict');
+    const { createTrustmark } = require(process.argv[1]);
+    const tm = createTrustmark({ modelDir: process.argv[2] });
+    assert.rejects(tm.ready({ signal: AbortSignal.abort() }), { name: 'AbortError' })
+      .then(() => process.stdout.write('AbortError handled\\n'))
+      .catch((error) => { console.error(error); process.exitCode = 1; });
+  `, require.resolve('..'), tempDir(t)], { encoding: 'utf8', timeout: 10000 });
+
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.stdout, 'AbortError handled\n');
+  assert.equal(child.stderr, '');
 });
 
 test('close() rejects waiting jobs, lets running ones finish and releases the sessions', async (t) => {
