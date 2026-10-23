@@ -85,6 +85,37 @@
   }
 
   /**
+   * Returns all-zero inputs for a model, e.g. for a first inference that absorbs one-time costs
+   * (WebAssembly thread start-up, WebGPU shader compilation).
+   * @param {Object} ort - The onnxruntime module.
+   * @param {string} name - Model name: 'resizer', 'encoder_<variant>' or 'decoder_<variant>'.
+   * @returns {Object} The feeds (a small 8x8 image for the resizer).
+   * @throws {Error} For another model name.
+   */
+  function zeroFeeds(ort, name) {
+    if (name === 'resizer') {
+      const dims = [1, 3, 8, 8];
+      return {
+        'X': new ort.Tensor('float32', new Float32Array(3 * 8 * 8), dims),
+        'scales': new ort.Tensor('float32', computeScalesFixed([4, 4], dims), [4]),
+        'target_size': new ort.Tensor('int64', new BigInt64Array([4n]), [1]),
+      };
+    }
+    const match = /^(encoder|decoder)_(.+)$/.exec(name);
+    if (!match) throw new Error(`no zero inputs are defined for the ${name} model`);
+    const variant = getVariant(match[2]);
+    if (match[1] === 'decoder') {
+      const size = variant.decodeResolution;
+      return { image: new ort.Tensor('float32', new Float32Array(3 * size * size), [1, 3, size, size]) };
+    }
+    const size = variant.encodeResolution;
+    return {
+      'onnx::Concat_0': new ort.Tensor('float32', new Float32Array(3 * size * size), [1, 3, size, size]),
+      'onnx::Gemm_1': new ort.Tensor('float32', new Float32Array(PACKET_BITS), [1, PACKET_BITS]),
+    };
+  }
+
+  /**
    * Returns the part of the image the watermark models see: the whole image, or the centred
    * square when the aspect ratio exceeds 2:1 (or when forceSquare is set, as for variant P).
    * Matches TrustMark.get_the_image_for_processing in the Python implementation.
@@ -103,6 +134,11 @@
     return { left: 0, top: 0, width, height };
   }
 
+  // v / 255 in float32 for every byte value v, as transforms.ToTensor() computes it
+  const BYTE_TO_UNIT = Float32Array.from({ length: 256 }, (_, v) => v / 255.0);
+  // v / 127.5 - 1 in float64 for every byte value v, as NumPy computes the cover in TrustMark.encode
+  const COVER_TO_UNIT = Float64Array.from({ length: 256 }, (_, v) => v / 127.5 - 1);
+
   /**
    * Extracts a region of an RGBA image as planar RGB floats in [0, 1] (CHW layout).
    * The alpha channel is ignored.
@@ -119,9 +155,9 @@
     for (let y = 0; y < region.height; y++) {
       let i = ((region.top + y) * image.width + region.left) * 4;
       for (let x = 0; x < region.width; x++, i += 4, k++) {
-        out[k] = data[i] / 255.0;
-        out[k + plane] = data[i + 1] / 255.0;
-        out[k + 2 * plane] = data[i + 2] / 255.0;
+        out[k] = BYTE_TO_UNIT[data[i]];
+        out[k + plane] = BYTE_TO_UNIT[data[i + 1]];
+        out[k + 2 * plane] = BYTE_TO_UNIT[data[i + 2]];
       }
     }
     return out;
@@ -222,9 +258,9 @@
           let b = half;
           for (let x = 0, i = rowStart + bounds[xx * 2] * 4; x < count; x++, i += 4) {
             const w = weights[k + x];
-            r += data[i] * w;
-            g += data[i + 1] * w;
-            b += data[i + 2] * w;
+            r = (r + Math.imul(data[i], w)) | 0;  // int32, like the C code
+            g = (g + Math.imul(data[i + 1], w)) | 0;
+            b = (b + Math.imul(data[i + 2], w)) | 0;
           }
           temp[o] = pillowClip8(r);
           temp[o + 1] = pillowClip8(g);
@@ -257,9 +293,9 @@
         let b = half;
         for (let y = 0; y < count; y++, i += rowStride) {
           const w = weights[k + y];
-          r += src[i] * w;
-          g += src[i + 1] * w;
-          b += src[i + 2] * w;
+          r = (r + Math.imul(src[i], w)) | 0;
+          g = (g + Math.imul(src[i + 1], w)) | 0;
+          b = (b + Math.imul(src[i + 2], w)) | 0;
         }
         out[o] = pillowClip8(r);
         out[o + plane] = pillowClip8(g);
@@ -373,6 +409,29 @@
   }
 
   /**
+   * Source indices and weights of a bilinear resize along one axis, with the half-pixel mapping
+   * of torch.nn.functional.interpolate (mode='bilinear', align_corners=False).
+   * @param {number} inSize - Input size.
+   * @param {number} outSize - Output size.
+   * @returns {{i0: Int32Array, i1: Int32Array, w1: Float64Array}} Output index d interpolates
+   *   inputs i0[d] and i1[d] with the weights 1 - w1[d] and w1[d].
+   */
+  function bilinearAxis(inSize, outSize) {
+    const scale = inSize / outSize;
+    const i0 = new Int32Array(outSize);
+    const i1 = new Int32Array(outSize);
+    const w1 = new Float64Array(outSize);
+    for (let d = 0; d < outSize; d++) {
+      const real = Math.max(0, scale * (d + 0.5) - 0.5);
+      const index = Math.floor(real);
+      i0[d] = index;
+      i1[d] = index < inSize - 1 ? index + 1 : index;
+      w1[d] = real - index;
+    }
+    return { i0, i1, w1 };
+  }
+
+  /**
    * Bilinear resize of planar float data, matching torch.nn.functional.interpolate with
    * mode='bilinear', align_corners=False and no antialiasing.
    *
@@ -385,23 +444,8 @@
    * @returns {Float32Array} channels * outH * outW values.
    */
   function bilinearResize(src, channels, inH, inW, outH, outW) {
-    // Source index and weight for each output row/column (PyTorch's half-pixel mapping)
-    function axis(inSize, outSize) {
-      const scale = inSize / outSize;
-      const i0 = new Int32Array(outSize);
-      const i1 = new Int32Array(outSize);
-      const w1 = new Float64Array(outSize);
-      for (let d = 0; d < outSize; d++) {
-        const real = Math.max(0, scale * (d + 0.5) - 0.5);
-        const index = Math.floor(real);
-        i0[d] = index;
-        i1[d] = index < inSize - 1 ? index + 1 : index;
-        w1[d] = real - index;
-      }
-      return { i0, i1, w1 };
-    }
-    const ys = axis(inH, outH);
-    const xs = axis(inW, outW);
+    const ys = bilinearAxis(inH, outH);
+    const xs = bilinearAxis(inW, outW);
 
     const out = new Float32Array(channels * outH * outW);
     let k = 0;
@@ -436,40 +480,74 @@
   }
 
   /**
-   * Adds a full-resolution residual to the processing region of an image and pastes it back
-   * with feathered edges, like the Python encoder (TrustMark.encode followed by
-   * put_the_image_after_processing). Pixels outside the region and the alpha channel are
-   * copied unchanged.
+   * Adds a residual to the processing region of an image and pastes it back with feathered
+   * edges, like the Python encoder (TrustMark.encode followed by put_the_image_after_processing).
+   * A residual smaller than the region (the 256x256 encoder output) is upscaled on the fly with
+   * exactly the arithmetic of bilinearResize, so no full-resolution copy of it is allocated.
+   * Pixels outside the region and the alpha channel are copied unchanged.
    *
    * @param {{data: ArrayLike<number>, width: number, height: number}} image - The RGBA cover image.
    * @param {{left: number, top: number, width: number, height: number}} region - The processed region.
-   * @param {Float32Array} residual - Planar RGB residual in [-1, 1] units, 3 * region.height * region.width.
+   * @param {Float32Array} residual - Planar RGB residual in [-1, 1] units,
+   *   3 * residualHeight * residualWidth values.
    * @param {number} strength - Residual multiplier (WM_STRENGTH).
+   * @param {number} [residualWidth=region.width] - Width of the residual.
+   * @param {number} [residualHeight=region.height] - Height of the residual.
    * @returns {Uint8ClampedArray} The watermarked RGBA pixels.
    */
-  function applyResidual(image, region, residual, strength) {
+  function applyResidual(image, region, residual, strength, residualWidth = region.width, residualHeight = region.height) {
     const out = new Uint8ClampedArray(image.data);
     const { left, top, width: rw, height: rh } = region;
-    const plane = rw * rh;
+    const plane = residualWidth * residualHeight;
     const feather = featherSize(rw, rh);
     const strength32 = Math.fround(strength);  // NumPy multiplies the float32 residual in float32
+    // A residual of the region size maps onto itself with weights 1 and 0
+    const ys = bilinearAxis(residualHeight, rh);
+    const xs = bilinearAxis(residualWidth, rw);
+
+    // Horizontally interpolated residual rows (3 * rw values), kept in float64 like the
+    // intermediate sums of bilinearResize; consecutive region rows mostly share their source rows
+    function interpolateRow(row, target) {
+      for (let c = 0, p = row * residualWidth, o = 0; c < 3; c++, p += plane) {
+        for (let rx = 0; rx < rw; rx++, o++) {
+          const wx1 = xs.w1[rx];
+          target[o] = (1 - wx1) * residual[p + xs.i0[rx]] + wx1 * residual[p + xs.i1[rx]];
+        }
+      }
+    }
+    let rows = [new Float64Array(3 * rw), new Float64Array(3 * rw)];
+    let loaded = [-1, -1];
 
     for (let ry = 0; ry < rh; ry++) {
+      const sources = [ys.i0[ry], ys.i1[ry]];
+      if (sources[0] === loaded[1] && sources[0] !== loaded[0]) {  // moving down: reuse the lower row
+        rows = [rows[1], rows[0]];
+        loaded = [loaded[1], loaded[0]];
+      }
+      for (let j = 0; j < 2; j++) {
+        if (loaded[j] !== sources[j]) {
+          interpolateRow(sources[j], rows[j]);
+          loaded[j] = sources[j];
+        }
+      }
+      const [top0, top1] = rows;
+      const wy1 = ys.w1[ry];
+      const wy0 = 1 - wy1;
+      // Python pastes the region, then blends the top, bottom, left and right bands in that
+      // order, each overwriting the previous; the last band covering a pixel decides its weight.
+      const rowBand = ry >= rh - feather ? rh - 1 - ry : (ry < feather ? ry : -1);
       for (let rx = 0; rx < rw; rx++) {
-        // Python pastes the region, then blends the top, bottom, left and right bands in that
-        // order, each overwriting the previous; the last band covering a pixel decides its weight.
-        let band = -1;
+        let band = rowBand;
         if (rx >= rw - feather) band = rw - 1 - rx;
         else if (rx < feather) band = rx;
-        else if (ry >= rh - feather) band = rh - 1 - ry;
-        else if (ry < feather) band = ry;
         const alpha = band < 0 ? 1 : (band + 1) / feather;
 
         const i = ((top + ry) * image.width + left + rx) * 4;
-        const k = ry * rw + rx;
-        for (let c = 0; c < 3; c++) {
+        for (let c = 0, o = rx; c < 3; c++, o += rw) {
+          // bilinearResize stores this value in a Float32Array
+          const r = Math.fround(wy0 * top0[o] + wy1 * top1[o]);
           const cover = image.data[i + c];
-          const stego = Math.min(1, Math.max(-1, Math.fround(residual[k + c * plane] * strength32) + cover / 127.5 - 1)) * 127.5 + 127.5;
+          const stego = Math.min(1, Math.max(-1, Math.fround(r * strength32) + COVER_TO_UNIT[cover])) * 127.5 + 127.5;
           const value = band < 0 ? stego : alpha * stego + (1 - alpha) * cover;
           // NumPy truncates when the Python implementation stores floats into its uint8 image
           out[i + c] = Math.floor(value);
@@ -512,7 +590,7 @@
     const region = processingRegion(image.width, image.height, config.forceSquare);
     // ToTensor() in [0, 1], then scaled to the [-1, 1] range of the encoder, in float32 like PyTorch
     const cover = new Float32Array(3 * size * size);
-    pillowBilinearResize(image, region, size, size).forEach((v, k) => { cover[k] = Math.fround(v / 255) * 2.0 - 1.0; });
+    pillowBilinearResize(image, region, size, size).forEach((v, k) => { cover[k] = BYTE_TO_UNIT[v] * 2.0 - 1.0; });
 
     const results = await runSession(runtime, encoder, {
       'onnx::Concat_0': new ort.Tensor('float32', cover, [1, 3, size, size]),
@@ -533,8 +611,8 @@
       for (let k = c * plane; k < (c + 1) * plane; k++) residual[k] -= mean;
     }
 
-    const upscaled = bilinearResize(residual, 3, size, size, region.height, region.width);
-    const data = applyResidual(image, region, upscaled, strength * config.strengthMultiplier);
+    // Upscaled to the region size while it is added, like torch.nn.functional.interpolate
+    const data = applyResidual(image, region, residual, strength * config.strengthMultiplier, size, size);
     return { data, width: image.width, height: image.height };
   }
 
@@ -544,6 +622,7 @@
     VARIANTS,
     getVariant,
     resolveEncodeOptions,
+    zeroFeeds,
     processingRegion,
     rgbaToPlanar,
     computeScalesFixed,
