@@ -1,11 +1,12 @@
 // The verified-release example (examples/verified-release/release.mjs): released files, job
-// records, idempotency, and that no failure path leaves anything in the public directory.
+// records, idempotency, and publication failures before and after the public link commits.
 // Uses the fake ONNX Runtime, plus the real models when TRUSTMARK_MODEL_DIR is set.
 // Run from js/node with: npm test
 
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import test from 'node:test';
@@ -27,7 +28,7 @@ function setup(t, fake = {}, options = {}) {
   const root = tempDir(t);
   const dirs = { privateDir: path.join(root, 'private'), publicDir: path.join(root, 'public') };
   const releaser = createReleaser({ trustmark, ...dirs, ...options });
-  return { releaser, log, ...dirs };
+  return { releaser, log, trustmark, ...dirs };
 }
 
 /** Every entry under dir, dot files included. */
@@ -60,6 +61,80 @@ test('a released job is not processed again, and concurrent calls share one run'
   assert.equal(again.sha256, a.sha256);
   assert.equal(log.packets.length, 1, 'no second watermarking');
   assert.deepEqual(listing(publicDir), ['job-2.png']);
+});
+
+test('a record write failure after publication returns the release and is recovered on retry', async (t) => {
+  const { releaser, log, trustmark, privateDir, publicDir } = setup(t);
+  const recordPath = path.join(privateDir, 'jobs', 'record-failure.json');
+  const rename = fsp.rename;
+  t.mock.method(fsp, 'rename', async (from, to) => {
+    if (to === recordPath && JSON.parse(await fsp.readFile(from, 'utf8')).state === 'released') {
+      throw Object.assign(new Error('cannot save released state'), { code: 'ENOSPC' });
+    }
+    return rename(from, to);
+  });
+
+  const released = await releaser.release('record-failure', GENERATED);
+  assert.equal(released.state, 'released');
+  assert.equal(released.warnings[0].operation, 'save_record');
+  assert.equal(released.warnings[0].code, 'ENOSPC');
+  assert.equal(released.warnings[0].path, recordPath);
+  assert.equal(crypto.createHash('sha256').update(fs.readFileSync(released.path)).digest('hex'), released.sha256);
+  assert.equal((await releaser.record('record-failure')).state, 'verified', 'the durable verification record is retained');
+
+  t.mock.restoreAll();
+  const restarted = createReleaser({ trustmark, privateDir, publicDir });
+  const recovered = await restarted.release('record-failure', Buffer.from('not a new image'));
+  assert.equal(recovered.reused, true);
+  assert.equal(recovered.sha256, released.sha256);
+  assert.deepEqual(recovered.warnings, []);
+  assert.equal((await restarted.record('record-failure')).state, 'released');
+  assert.equal(log.packets.length, 1, 'recovery does not encode the job a second time');
+
+  // A verified record only authorizes recovery of exactly the verified bytes.
+  const record = await restarted.record('record-failure');
+  record.state = 'verified';
+  fs.writeFileSync(recordPath, JSON.stringify(record));
+  fs.writeFileSync(released.path, 'tampered');
+  await assert.rejects(restarted.release('record-failure', GENERATED), { code: 'RELEASE_CONFLICT' });
+  assert.equal(log.packets.length, 1);
+  assert.equal(fs.readFileSync(released.path, 'utf8'), 'tampered');
+});
+
+for (const target of ['original', 'staging']) {
+  test(`${target} cleanup failure cannot turn a committed release into a failure`, async (t) => {
+    const { releaser, log, privateDir } = setup(t);
+    const originalPath = path.join(privateDir, 'cleanup-job.original');
+    const rm = fsp.rm;
+    t.mock.method(fsp, 'rm', async (file, options) => {
+      if (target === 'original' ? file === originalPath
+        : path.dirname(file) === privateDir && /^\.cleanup-job\..*\.png$/.test(path.basename(file))) {
+        throw Object.assign(new Error('cannot remove private file'), { code: 'EACCES' });
+      }
+      return rm(file, options);
+    });
+    const released = await releaser.release('cleanup-job', GENERATED);
+    assert.equal(released.state, 'released');
+    assert.equal(released.warnings[0].operation, `${target}_cleanup`);
+    assert.equal(released.warnings[0].code, 'EACCES');
+    assert.ok(fs.existsSync(released.warnings[0].path));
+    assert.equal((await releaser.record('cleanup-job')).state, 'released');
+    assert.equal(crypto.createHash('sha256').update(fs.readFileSync(released.path)).digest('hex'), released.sha256);
+    t.mock.restoreAll();
+    const again = await releaser.release('cleanup-job', GENERATED);
+    assert.equal(again.reused, true);
+    assert.equal(log.packets.length, 1);
+    assert.ok(!fs.existsSync(originalPath), 'a retry also completes original cleanup');
+  });
+}
+
+test('a failed public link still rejects and leaves the image private', async (t) => {
+  const { releaser, privateDir, publicDir } = setup(t);
+  t.mock.method(fsp, 'link', async () => { throw Object.assign(new Error('link refused'), { code: 'EACCES' }); });
+  await assert.rejects(releaser.release('link-failure', GENERATED), { code: 'EACCES' });
+  assert.deepEqual(listing(publicDir), []);
+  assert.equal((await releaser.record('link-failure')).state, 'failed');
+  assert.deepEqual(listing(privateDir), ['jobs', 'jobs/link-failure.json', 'link-failure.original']);
 });
 
 const FAILURES = [

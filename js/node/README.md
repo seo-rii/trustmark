@@ -151,8 +151,12 @@ whom, and where, belongs to the service that calls it.
 use it: the generated image stays in a private directory, `encodeVerified` produces the verified
 bytes, which are staged privately and published into a public directory with an atomic,
 no-clobber hard link; a JSON record per job id tracks `generated`, `verified`, `released` or
-`failed`, and a released job id is not processed again. No failure leaves a file in the public
-directory. `examples/verified-release/demo.mjs` runs it from the command line.
+`failed`, and a released job id is not processed again. Failures before publication leave the
+original private. The hard link commits the release: subsequent record or cleanup errors return
+`state: 'released'` with `warnings` entries (`operation`, `path`, `code`, `message`). A retry checks
+the public file against the durable verification digest and completes the release record and
+original cleanup without encoding again. A staging-cleanup warning names the private file left
+for cleanup. `examples/verified-release/demo.mjs` reports these warnings from the command line.
 
 What this does not guarantee:
 

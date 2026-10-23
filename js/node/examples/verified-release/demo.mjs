@@ -25,8 +25,11 @@ try {
   const releaser = createReleaser({ trustmark, privateDir, publicDir, format, retryStrengths: [1.25, 1.5] });
   const released = await releaser.release(jobId, await fs.readFile(input), { signal: AbortSignal.timeout(120000) });
   console.log(`${released.reused ? 'already released' : 'released'} ${released.path} (sha256 ${released.sha256}, payload ${released.payload})`);
+  for (const warning of released.warnings) {
+    console.warn(`released with warning: ${warning.operation} ${warning.path}: ${warning.code}: ${warning.message}`);
+  }
 } catch (error) {
-  // Nothing was published: the public directory has no file for this job
+  // This call did not publish new bytes; an earlier release or conflicting file may exist.
   console.error(`not released: ${error.code || error.name}${error.reason ? ` (${error.reason})` : ''}: ${error.message}`);
   process.exitCode = 1;
 } finally {

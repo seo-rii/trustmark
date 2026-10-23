@@ -4,8 +4,9 @@
 // encodes the final file and reads the watermark back from those exact bytes; only then are the
 // bytes staged in the private directory and published into the public directory with an atomic,
 // no-clobber hard link. Every state change is recorded in a per-job JSON record, and a job id
-// that was already released is not processed again. If anything fails, nothing is written to
-// the public directory, and the original never leaves the private one.
+// that was already released is not processed again. Failures before publication leave the
+// original private. Once the public link commits, the result stays released; record or cleanup
+// errors are returned as warnings, and a retry reconciles the durable record with the public file.
 //
 // What this does NOT guarantee:
 // - It is not authentication or proof of origin. Anyone with the public models can read a
@@ -140,16 +141,45 @@ export function createReleaser({ trustmark, privateDir, publicDir, format = 'png
     await writeAtomic(recordPath(record.jobId), JSON.stringify(record, null, 2), 0o600);
   }
 
+  // The verified public bytes already exist. Recording that fact and cleaning private files
+  // may fail independently, but neither can undo the publication or turn it into a failed job.
+  async function finishRelease(record, publicPath, reused, staged = null) {
+    const warnings = [];
+    if (record.state !== 'released') {
+      record.state = 'released';
+      record.error = null;
+      try {
+        await saveRecord(record);
+      } catch (error) {
+        warnings.push({ operation: 'save_record', path: recordPath(record.jobId), code: error.code || error.name, message: error.message });
+      }
+    }
+    const cleanup = [['original_cleanup', path.join(privateDir, `${record.jobId}.original`)]];
+    if (staged) cleanup.push(['staging_cleanup', staged]);
+    for (const [operation, file] of cleanup) {
+      try {
+        await fs.rm(file, { force: true });
+      } catch (error) {
+        warnings.push({ operation, path: file, code: error.code || error.name, message: error.message });
+      }
+    }
+    return { jobId: record.jobId, state: 'released', path: publicPath, sha256: record.sha256, payload: record.payload, reused, warnings };
+  }
+
   async function run(jobId, generated, signal) {
     await prepareDirectories();
     const publicPath = path.join(publicDir, `${jobId}.${extension}`);
 
     const previous = await readRecord(jobId);
-    if (previous && previous.state === 'released') {
-      if ((await sha256File(publicPath)) !== previous.sha256) {
-        throw new ReleaseError('RELEASE_CONFLICT', `Job ${jobId} was released, but ${publicPath} is missing or was changed`);
+    if (previous && (previous.state === 'released' || previous.state === 'verified')) {
+      const publicDigest = await sha256File(publicPath);
+      if (publicDigest !== null && publicDigest === previous.sha256) {
+        // The public link may have committed before the released record could be saved.
+        return finishRelease(previous, publicPath, true);
       }
-      return { jobId, state: 'released', path: publicPath, sha256: previous.sha256, payload: previous.payload, reused: true };
+      if (previous.state === 'released' || publicDigest !== null) {
+        throw new ReleaseError('RELEASE_CONFLICT', `Job ${jobId} has a recorded watermark, but ${publicPath} is missing or was changed`);
+      }
     }
 
     const payload = payloadForJob(jobId, trustmark.capacity);
@@ -182,26 +212,22 @@ export function createReleaser({ trustmark, privateDir, publicDir, format = 'png
         }
         // An earlier run of this job published the same bytes but did not record it
       }
-      record.state = 'released';
-      await saveRecord(record);
-      await fs.rm(originalPath, { force: true });
-      return { jobId, state: 'released', path: publicPath, sha256: result.sha256, payload: result.payload, reused: false };
     } catch (error) {
       record.state = 'failed';
       record.error = { code: error.code || error.name, reason: error.reason || null, message: error.message };
       await saveRecord(record).catch(() => {});
+      if (staged) await fs.rm(staged, { force: true }).catch(() => {});
       throw error;
-    } finally {
-      if (staged) await fs.rm(staged, { force: true });
     }
+    return finishRelease(record, publicPath, false, staged);
   }
 
   /**
    * Releases a generated image (PNG or JPEG bytes) under `jobId`, at most once. Concurrent
    * calls for the same job share one run; a released job returns the existing file
-   * (reused: true).
+   * (reused: true). Once publication commits, record/cleanup errors are returned in warnings.
    *
-   * @returns {Promise<{jobId, state: 'released', path, sha256, payload, reused}>}
+   * @returns {Promise<{jobId, state: 'released', path, sha256, payload, reused, warnings}>}
    */
   function release(jobId, generated, { signal } = {}) {
     if (typeof jobId !== 'string' || !JOB_ID.test(jobId)) {
