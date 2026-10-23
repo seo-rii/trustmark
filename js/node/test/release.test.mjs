@@ -127,6 +127,39 @@ test('rejects unsafe job ids and overlapping directories', async (t) => {
   assert.throws(() => createReleaser({ trustmark, privateDir: root, publicDir: root }), { code: 'INVALID_CONFIG' });
 });
 
+for (const overlap of ['same', 'private-in-public', 'public-in-private']) {
+  test(`rejects directory aliases before writing private data (${overlap})`, async (t) => {
+    const root = tempDir(t);
+    const actual = path.join(root, 'actual');
+    const nested = path.join(actual, 'nested');
+    const alias = path.join(root, 'alias');
+    fs.mkdirSync(nested, { recursive: true });
+    fs.symlinkSync(actual, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const dirs = overlap === 'same' ? { privateDir: alias, publicDir: actual }
+      : overlap === 'private-in-public' ? { privateDir: path.join(alias, 'nested'), publicDir: actual }
+      : { privateDir: actual, publicDir: path.join(alias, 'nested') };
+    const { releaser, log } = setup(t, {}, dirs);
+    const before = listing(root);
+    await assert.rejects(releaser.release('alias-job', GENERATED), { code: 'INVALID_CONFIG' });
+    assert.deepEqual(listing(root), before, 'no originals, job records or staging files are written');
+    assert.equal(log.runs.length, 0, 'invalid directories are rejected before inference');
+  });
+}
+
+test('allows symlinks that resolve to separate directories', async (t) => {
+  const root = tempDir(t);
+  const privateDir = path.join(root, 'private');
+  const publicDir = path.join(root, 'public');
+  const alias = path.join(root, 'private-alias');
+  fs.mkdirSync(privateDir);
+  fs.symlinkSync(privateDir, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const { releaser } = setup(t, {}, { privateDir: alias, publicDir });
+  const result = await releaser.release('separate-job', GENERATED);
+  assert.equal(result.state, 'released');
+  assert.deepEqual(listing(publicDir), ['separate-job.png']);
+  assert.equal((await releaser.record('separate-job')).state, 'released');
+});
+
 const skip = modelSkipReason();
 
 test('real models: releases a verified JPEG and refuses one at quality 1', { skip, timeout: 300000 }, async (t) => {

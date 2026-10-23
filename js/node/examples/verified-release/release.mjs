@@ -76,6 +76,15 @@ export function payloadForJob(jobId, capacity) {
   return Array.from(digest, (byte) => byte.toString(2).padStart(8, '0')).join('').slice(0, capacity);
 }
 
+function assertSeparateDirectories(privateDir, publicDir) {
+  for (const [parent, child] of [[privateDir, publicDir], [publicDir, privateDir]]) {
+    const relative = path.relative(parent, child);
+    if (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`)) {
+      throw new ReleaseError('INVALID_CONFIG', 'The private and public directories must be separate, and neither may contain the other');
+    }
+  }
+}
+
 /**
  * @param {object} config
  * @param {object} config.trustmark - Instance from createTrustmark.
@@ -87,13 +96,33 @@ export function payloadForJob(jobId, capacity) {
  * @param {number[]} [config.retryStrengths] - Passed to encodeVerified.
  */
 export function createReleaser({ trustmark, privateDir, publicDir, format = 'png', quality, retryStrengths = [] }) {
-  const [priv, pub] = [path.resolve(privateDir), path.resolve(publicDir)];
-  if (priv === pub || priv.startsWith(pub + path.sep) || pub.startsWith(priv + path.sep)) {
-    throw new ReleaseError('INVALID_CONFIG', 'The private and public directories must be separate, and neither may contain the other');
-  }
-  const jobsDir = path.join(privateDir, 'jobs');
+  [privateDir, publicDir] = [path.resolve(privateDir), path.resolve(publicDir)];
+  assertSeparateDirectories(privateDir, publicDir);
+  let jobsDir = path.join(privateDir, 'jobs');
+  let preparation = null;
   const extension = format === 'jpeg' ? 'jpg' : 'png';
   const running = new Map();
+
+  function prepareDirectories() {
+    if (!preparation) {
+      preparation = (async () => {
+        await fs.mkdir(privateDir, { recursive: true, mode: 0o700 });
+        await fs.mkdir(publicDir, { recursive: true });
+        const [privatePath, publicPath] = await Promise.all([fs.realpath(privateDir), fs.realpath(publicDir)]);
+        // Resolve aliases before creating any originals, records or staging files, and use
+        // the resolved paths for the subsequent writes.
+        assertSeparateDirectories(privatePath, publicPath);
+        privateDir = privatePath;
+        publicDir = publicPath;
+        jobsDir = path.join(privateDir, 'jobs');
+        await fs.mkdir(jobsDir, { recursive: true, mode: 0o700 });
+      })().catch((error) => {
+        preparation = null;
+        throw error;
+      });
+    }
+    return preparation;
+  }
 
   const recordPath = (jobId) => path.join(jobsDir, `${jobId}.json`);
 
@@ -112,8 +141,7 @@ export function createReleaser({ trustmark, privateDir, publicDir, format = 'png
   }
 
   async function run(jobId, generated, signal) {
-    await fs.mkdir(jobsDir, { recursive: true, mode: 0o700 });
-    await fs.mkdir(publicDir, { recursive: true });
+    await prepareDirectories();
     const publicPath = path.join(publicDir, `${jobId}.${extension}`);
 
     const previous = await readRecord(jobId);
