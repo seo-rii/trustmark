@@ -164,7 +164,9 @@ pub(crate) fn load(
 }
 
 fn builder(options: &SessionOptions) -> Result<SessionBuilder, Error> {
+    // The selected provider and CPU fallback must not inherit the host's default providers.
     let mut builder = Session::builder()?
+        .with_no_environment_execution_providers()?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_intra_threads(options.intra_threads)?;
     if let Some(spinning) = options.intra_op_spinning {
