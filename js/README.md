@@ -109,6 +109,8 @@ const bits = await TrustmarkCore.decodeBits(runtime, decoderPSession, watermarke
 
 `tm_datalayer.js` (`DataLayer_Encode`, `DataLayer_Decode`, `DataLayer_GetSchemaVersion`) relies on the globals of `deps/bch_ecc.min.js`, so in Node.js load both into a `vm` context as the tests do.
 
+For server-side use, the [`node`](node/README.md) directory has a typed Node.js SDK built on these files: PNG and JPEG input and output, model files with optional digests and downloads, ONNX Runtime execution providers, a job queue with `AbortSignal` support, and tests against the Python implementation.
+
 Agreement with the Python implementation (`TrustMark.encode` with PyTorch on the CPU and Pillow 12.3) for the four variants and four schemas on `images/ghost.png` (RGBA), `ufo_240.jpg`, `ripley.jpg` and 4:1, 1:4 and odd-sized crops of `ripley.jpg` (96 combinations): the JavaScript output differs from the Python output by at most 1 per channel, its PSNR is within 0.06 dB of Python's, the alpha channel is unchanged, and both the Python implementation and the JavaScript decoders recover the exact payload and schema from every JavaScript output; the JavaScript decoders also recover them from every Python output. The remaining differences come from the ONNX encoders and float rounding.
 
 Limitations:

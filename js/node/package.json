@@ -1,0 +1,33 @@
+{
+  "name": "trustmark-node",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js SDK for embedding and reading TrustMark watermarks with ONNX Runtime",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "tsc -p test/types"
+  },
+  "dependencies": {
+    "jpeg-js": "^0.4.4",
+    "onnxruntime-node": "^1.30.0",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "~5.9.3"
+  }
+}
