@@ -15,7 +15,8 @@
  * Most functions take a `runtime` object:
  *   { ort, resizer, run }
  *   - ort: the onnxruntime module (onnxruntime-web or onnxruntime-node), used for ort.Tensor
- *   - resizer: an InferenceSession of resizer.onnx (antialiased downscaler, WASM/CPU only)
+ *   - resizer: an InferenceSession of resizer.onnx (antialiased downscaler, WASM/CPU only), used
+ *     by the decoders; embedding resizes in JavaScript and does not need it
  *   - run: optional (session, feeds) => Promise<outputs>, e.g. a queue that serializes WebGPU
  *     inference; defaults to session.run(feeds)
  *
@@ -37,6 +38,51 @@
   const FEATHERING_RESIDUAL = 0.01;  // feather width as a fraction of the processed region
   const MAX_FEATHER = 50;
   const PACKET_BITS = 100;
+
+  /**
+   * Settings of each TrustMark variant, shared by embedding and decoding, from TrustMark.__init__
+   * and TrustMark.encode in the Python implementation:
+   *   - encoder, decoder: ONNX model names (`${name}.onnx`)
+   *   - encodeResolution, decodeResolution: model input sizes. The Python decoders of B, C and Q
+   *     run at 245x245, but their ONNX exports take 256x256 inputs.
+   *   - forceSquare: always process the centred square (P), instead of only above a 2:1 aspect ratio
+   *   - strengthMultiplier: factor applied to the requested watermark strength (P: 1.25)
+   */
+  const VARIANTS = Object.freeze({
+    Q: Object.freeze({ code: 'Q', encoder: 'encoder_Q', decoder: 'decoder_Q', encodeResolution: ENCODER_RESOLUTION, decodeResolution: 256, forceSquare: false, strengthMultiplier: 1.0 }),
+    P: Object.freeze({ code: 'P', encoder: 'encoder_P', decoder: 'decoder_P', encodeResolution: ENCODER_RESOLUTION, decodeResolution: 224, forceSquare: true, strengthMultiplier: 1.25 }),
+    B: Object.freeze({ code: 'B', encoder: 'encoder_B', decoder: 'decoder_B', encodeResolution: ENCODER_RESOLUTION, decodeResolution: 256, forceSquare: false, strengthMultiplier: 1.0 }),
+    C: Object.freeze({ code: 'C', encoder: 'encoder_C', decoder: 'decoder_C', encodeResolution: ENCODER_RESOLUTION, decodeResolution: 256, forceSquare: false, strengthMultiplier: 1.0 }),
+  });
+
+  /**
+   * Returns the settings of a variant.
+   * @param {string} code - Variant code: 'Q', 'P', 'B' or 'C'.
+   * @returns {Object} The VARIANTS entry.
+   * @throws {Error} For an unknown variant.
+   */
+  function getVariant(code) {
+    if (typeof code !== 'string' || !Object.prototype.hasOwnProperty.call(VARIANTS, code)) {
+      throw new Error(`Unknown TrustMark variant ${JSON.stringify(code)}; expected one of ${Object.keys(VARIANTS).join(', ')}`);
+    }
+    return VARIANTS[code];
+  }
+
+  /**
+   * Validates the options of encodeWatermark and applies their defaults.
+   * @param {Object} [options] - { variant = 'Q', strength = 1.0 }.
+   * @returns {{variant: Object, strength: number}} The VARIANTS entry and the requested strength
+   *   (before the variant's multiplier).
+   * @throws {Error} For an unknown variant or a negative or non-numeric strength.
+   */
+  function resolveEncodeOptions(options = {}) {
+    const variant = getVariant(options.variant === undefined ? 'Q' : options.variant);
+    const strength = options.strength === undefined ? 1.0 : options.strength;
+    if (!(typeof strength === 'number' && strength >= 0 && Number.isFinite(strength))) {
+      throw new Error('strength must be a non-negative number');
+    }
+    return { variant, strength };
+  }
 
   /**
    * Returns the part of the image the watermark models see: the whole image, or the centred
@@ -76,6 +122,148 @@
         out[k] = data[i] / 255.0;
         out[k + plane] = data[i + 1] / 255.0;
         out[k + 2 * plane] = data[i + 2] / 255.0;
+      }
+    }
+    return out;
+  }
+
+  // Pillow's fixed-point precision for 8-bit images (PRECISION_BITS = 32 - 8 - 2 in Resample.c)
+  const PILLOW_PRECISION_BITS = 22;
+  const PILLOW_ONE = 1 << PILLOW_PRECISION_BITS;
+
+  /**
+   * Resampling bounds and fixed-point weights for one axis of pillowBilinearResize
+   * (precompute_coeffs and normalize_coeffs_8bpc in Pillow's Resample.c, bilinear filter).
+   * @param {number} inSize - Input size.
+   * @param {number} outSize - Output size.
+   * @returns {{ksize: number, bounds: Int32Array, weights: Int32Array}} Output index i reads
+   *   bounds[2i + 1] inputs from bounds[2i] on, with the weights weights[i * ksize + j].
+   */
+  function pillowCoefficients(inSize, outSize) {
+    const scale = inSize / outSize;
+    const filterscale = Math.max(1.0, scale);  // antialiasing: widen the filter when reducing
+    const support = 1.0 * filterscale;         // the triangle filter has a support of 1
+    const ss = 1.0 / filterscale;
+    const ksize = Math.ceil(support) * 2 + 1;
+    const bounds = new Int32Array(outSize * 2);
+    const weights = new Int32Array(outSize * ksize);
+    const kernel = new Float64Array(ksize);
+    for (let xx = 0; xx < outSize; xx++) {
+      const center = (xx + 0.5) * scale;
+      // C truncates towards zero when converting to int
+      const xmin = Math.max(0, Math.trunc(center - support + 0.5));
+      const count = Math.min(inSize, Math.trunc(center + support + 0.5)) - xmin;
+      let total = 0.0;
+      for (let x = 0; x < count; x++) {
+        const w = Math.max(0.0, 1.0 - Math.abs((x + xmin - center + 0.5) * ss));
+        kernel[x] = w;
+        total += w;
+      }
+      for (let x = 0; x < count; x++) {
+        const w = total !== 0.0 ? kernel[x] / total : kernel[x];
+        weights[xx * ksize + x] = Math.trunc(0.5 + w * PILLOW_ONE);  // the weights are never negative
+      }
+      bounds[xx * 2] = xmin;
+      bounds[xx * 2 + 1] = count;
+    }
+    return { ksize, bounds, weights };
+  }
+
+  /**
+   * Rounds and clips a Pillow fixed-point sum to a byte (clip8 in Resample.c).
+   * @param {number} sum - The sum, including the rounding offset.
+   * @returns {number} 0 to 255.
+   */
+  function pillowClip8(sum) {
+    if (sum >= PILLOW_ONE * 256) return 255;
+    if (sum <= 0) return 0;
+    return sum >> PILLOW_PRECISION_BITS;
+  }
+
+  /**
+   * Resizes a region of an RGBA image like Pillow's `Image.resize(size, Image.BILINEAR)` on an
+   * RGB image, which the Python implementation uses before its models: an antialiased triangle
+   * filter in two passes (horizontal, then vertical) with Pillow's 8-bit fixed-point arithmetic
+   * and rounding after each pass, so the result is bit-exact. The alpha channel is ignored.
+   * (Pillow 12 resizes images more than 100 times taller than wide vertically first; the regions
+   * TrustMark processes are at most 2:1.)
+   *
+   * @param {{data: ArrayLike<number>, width: number}} image - The RGBA image.
+   * @param {{left: number, top: number, width: number, height: number}} region - The region to resize.
+   * @param {number} outWidth - Output width.
+   * @param {number} outHeight - Output height.
+   * @returns {Uint8Array} Planar RGB bytes (CHW layout), 3 * outHeight * outWidth values.
+   */
+  function pillowBilinearResize(image, region, outWidth, outHeight) {
+    const { data } = image;
+    const stride = image.width * 4;
+    const half = PILLOW_ONE >> 1;
+    const vertical = pillowCoefficients(region.height, outHeight);
+
+    // Source of the vertical pass: the horizontally resized rows (RGB) or the image itself (RGBA),
+    // addressed as src[origin + row * rowStride + x * step] for region rows and output columns
+    let src = data;
+    let origin = region.top * stride + region.left * 4;
+    let rowStride = stride;
+    let step = 4;
+    if (outWidth !== region.width) {  // Pillow skips a pass whose size does not change
+      // Only the region rows that the vertical pass reads
+      const firstRow = vertical.bounds[0];
+      const rows = vertical.bounds[2 * outHeight - 2] + vertical.bounds[2 * outHeight - 1] - firstRow;
+      const { ksize, bounds, weights } = pillowCoefficients(region.width, outWidth);
+      const temp = new Uint8Array(rows * outWidth * 3);
+      for (let y = 0, o = 0; y < rows; y++) {
+        const rowStart = origin + (firstRow + y) * stride;
+        for (let xx = 0; xx < outWidth; xx++, o += 3) {
+          const count = bounds[xx * 2 + 1];
+          const k = xx * ksize;
+          let r = half;
+          let g = half;
+          let b = half;
+          for (let x = 0, i = rowStart + bounds[xx * 2] * 4; x < count; x++, i += 4) {
+            const w = weights[k + x];
+            r += data[i] * w;
+            g += data[i + 1] * w;
+            b += data[i + 2] * w;
+          }
+          temp[o] = pillowClip8(r);
+          temp[o + 1] = pillowClip8(g);
+          temp[o + 2] = pillowClip8(b);
+        }
+      }
+      src = temp;
+      rowStride = outWidth * 3;
+      origin = -firstRow * rowStride;
+      step = 3;
+    }
+
+    const plane = outWidth * outHeight;
+    const out = new Uint8Array(3 * plane);
+    const { ksize, bounds, weights } = vertical;
+    const resize = outHeight !== region.height;
+    for (let yy = 0, o = 0; yy < outHeight; yy++) {
+      const count = bounds[yy * 2 + 1];
+      const k = yy * ksize;
+      for (let x = 0; x < outWidth; x++, o++) {
+        let i = origin + (resize ? bounds[yy * 2] : yy) * rowStride + x * step;
+        if (!resize) {
+          out[o] = src[i];
+          out[o + plane] = src[i + 1];
+          out[o + 2 * plane] = src[i + 2];
+          continue;
+        }
+        let r = half;
+        let g = half;
+        let b = half;
+        for (let y = 0; y < count; y++, i += rowStride) {
+          const w = weights[k + y];
+          r += src[i] * w;
+          g += src[i + 1] * w;
+          b += src[i + 2] * w;
+        }
+        out[o] = pillowClip8(r);
+        out[o + plane] = pillowClip8(g);
+        out[o + 2 * plane] = pillowClip8(b);
       }
     }
     return out;
@@ -169,13 +357,14 @@
    * that the Python (ToTensor() * 2 - 1) and Rust implementations feed them.
    *
    * @param {Object} runtime - { ort, resizer, run } (see the top of this file).
-   * @param {Object} decoder - InferenceSession of the decoder model.
+   * @param {Object} decoder - InferenceSession of the decoder model of the variant.
    * @param {{data: ArrayLike<number>, width: number, height: number}} image - The RGBA image.
-   * @param {number} resolution - Decoder resolution (Q: 256, P: 224).
-   * @param {boolean} [forceSquare=false] - Always use the centred square (variant P).
+   * @param {string} [variant='Q'] - Variant code of the decoder; selects its resolution and crop
+   *   (see VARIANTS).
    * @returns {Promise<Array<boolean>>} The 100 packet bits.
    */
-  async function decodeBits(runtime, decoder, image, resolution, forceSquare = false) {
+  async function decodeBits(runtime, decoder, image, variant = 'Q') {
+    const { decodeResolution: resolution, forceSquare } = getVariant(variant);
     const { pixels } = await preprocess(runtime, image, resolution, forceSquare);
     const scaled = Float32Array.from(pixels, (v) => v * 2.0 - 1.0);  // [0, 1] -> [-1, 1]
     const input = new runtime.ort.Tensor('float32', scaled, [1, 3, resolution, resolution]);
@@ -263,6 +452,7 @@
     const { left, top, width: rw, height: rh } = region;
     const plane = rw * rh;
     const feather = featherSize(rw, rh);
+    const strength32 = Math.fround(strength);  // NumPy multiplies the float32 residual in float32
 
     for (let ry = 0; ry < rh; ry++) {
       for (let rx = 0; rx < rw; rx++) {
@@ -279,7 +469,7 @@
         const k = ry * rw + rx;
         for (let c = 0; c < 3; c++) {
           const cover = image.data[i + c];
-          const stego = Math.min(1, Math.max(-1, residual[k + c * plane] * strength + cover / 127.5 - 1)) * 127.5 + 127.5;
+          const stego = Math.min(1, Math.max(-1, Math.fround(residual[k + c * plane] * strength32) + cover / 127.5 - 1)) * 127.5 + 127.5;
           const value = band < 0 ? stego : alpha * stego + (1 - alpha) * cover;
           // NumPy truncates when the Python implementation stores floats into its uint8 image
           out[i + c] = Math.floor(value);
@@ -290,39 +480,39 @@
   }
 
   /**
-   * Embeds a watermark packet into an image with a TrustMark encoder model, following the
-   * Python implementation: centre-square crop for aspect ratios above 2:1, antialiased
-   * downscale to 256x256, encoder inference, per-channel mean removal of the residual,
-   * bilinear upscale of the residual and feathered paste into the original pixels.
-   * The alpha channel is preserved.
+   * Embeds a watermark packet into an image with a TrustMark encoder model, following
+   * TrustMark.encode in the Python implementation: the processing region (the centred square for
+   * aspect ratios above 2:1, and always for variant P) is downscaled to 256x256 exactly like
+   * Pillow's bilinear resize, then come encoder inference, per-channel mean removal of the
+   * residual, bilinear upscale of the residual, the variant's strength multiplier and a feathered
+   * paste into the original pixels. The alpha channel is preserved.
    *
-   * Only variant Q has been verified; P would need its 1.25 strength multiplier and square crop.
-   *
-   * @param {Object} runtime - { ort, resizer, run } (see the top of this file).
-   * @param {Object} encoder - InferenceSession of the encoder model (encoder_Q.onnx).
+   * @param {Object} runtime - { ort, run } (see the top of this file); the resizer is not needed.
+   * @param {Object} encoder - InferenceSession of the encoder model of the variant (e.g. encoder_Q.onnx).
    * @param {{data: ArrayLike<number>, width: number, height: number}} image - The RGBA cover image.
    * @param {ArrayLike<number>} packet - The 100 packet bits (0/1), e.g. from DataLayer_Encode.
    * @param {Object} [options]
-   * @param {number} [options.strength=1.0] - Watermark strength (WM_STRENGTH in Python).
+   * @param {string} [options.variant='Q'] - Variant code of the encoder (see VARIANTS).
+   * @param {number} [options.strength=1.0] - Watermark strength (WM_STRENGTH in Python); variant P
+   *   multiplies it by 1.25 as Python does.
    * @returns {Promise<{data: Uint8ClampedArray, width: number, height: number}>} The watermarked image.
    */
   async function encodeWatermark(runtime, encoder, image, packet, options = {}) {
     const { ort } = runtime;
-    const strength = options.strength === undefined ? 1.0 : options.strength;
+    const { variant: config, strength } = resolveEncodeOptions(options);
     if (!encoder) throw new Error('encoder model is not loaded');
     if (!packet || packet.length !== PACKET_BITS || !Array.from(packet).every((b) => b === 0 || b === 1)) {
       throw new Error(`the packet must contain ${PACKET_BITS} bits of 0 or 1`);
-    }
-    if (!(typeof strength === 'number' && strength >= 0 && Number.isFinite(strength))) {
-      throw new Error('strength must be a non-negative number');
     }
     if (!image || !(image.width > 0) || !(image.height > 0) || !image.data || image.data.length !== image.width * image.height * 4) {
       throw new Error('the image must be RGBA data with a positive width and height');
     }
 
-    const size = ENCODER_RESOLUTION;
-    const { region, pixels } = await preprocess(runtime, image, size);
-    const cover = Float32Array.from(pixels, (v) => v * 2.0 - 1.0);  // the encoder works in [-1, 1]
+    const size = config.encodeResolution;
+    const region = processingRegion(image.width, image.height, config.forceSquare);
+    // ToTensor() in [0, 1], then scaled to the [-1, 1] range of the encoder, in float32 like PyTorch
+    const cover = new Float32Array(3 * size * size);
+    pillowBilinearResize(image, region, size, size).forEach((v, k) => { cover[k] = Math.fround(v / 255) * 2.0 - 1.0; });
 
     const results = await runSession(runtime, encoder, {
       'onnx::Concat_0': new ort.Tensor('float32', cover, [1, 3, size, size]),
@@ -344,15 +534,20 @@
     }
 
     const upscaled = bilinearResize(residual, 3, size, size, region.height, region.width);
-    return { data: applyResidual(image, region, upscaled, strength), width: image.width, height: image.height };
+    const data = applyResidual(image, region, upscaled, strength * config.strengthMultiplier);
+    return { data, width: image.width, height: image.height };
   }
 
   return {
     ENCODER_RESOLUTION,
     PACKET_BITS,
+    VARIANTS,
+    getVariant,
+    resolveEncodeOptions,
     processingRegion,
     rgbaToPlanar,
     computeScalesFixed,
+    pillowBilinearResize,
     preprocess,
     decodeBits,
     bilinearResize,

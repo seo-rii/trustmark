@@ -25,6 +25,9 @@ function deferred() {
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+// File names of fetched URLs
+const fileNames = (urls) => urls.map((url) => url.slice(url.lastIndexOf('/') + 1));
+
 // Values created inside the vm context have that context's prototypes
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
@@ -56,8 +59,8 @@ function fakeOrt({ failCreate = () => null, decoderOutputs = {}, runLog = [] } =
             const size = Number(feeds.target_size.data[0]);
             return { Y: new Tensor('float32', new Float32Array(3 * size * size), [1, 3, size, size]) };
           }
-          if (name === 'encoder_Q') {
-            encoderFeeds.push(feeds);
+          if (name.startsWith('encoder_')) {
+            encoderFeeds.push({ name, feeds });
             return { image: feeds['onnx::Concat_0'] };
           }
           return { output: new Tensor('float32', Float32Array.from(decoderOutputs[name]), [1, 100]) };
@@ -281,6 +284,56 @@ test('inferences run one at a time in FIFO order, and a failure does not stall t
 
 const rgbaImage = (width, height) => ({ data: new Uint8ClampedArray(width * height * 4).fill(200), width, height });
 
+test('the demo does not report a pending encoder as failed when embedding during startup', async () => {
+  const gate = deferred();
+  const tm = loadWatermark({ ort: fakeOrt(), fetch: fakeFetch({ gate: gate.promise }), autoInit: false });
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) {
+      const classes = new Set();
+      const listeners = new Map();
+      elements.set(id, {
+        textContent: '', value: '', style: {}, disabled: false, files: [],
+        classList: {
+          add: (name) => classes.add(name),
+          remove: (name) => classes.delete(name),
+          toggle: (name, enabled) => enabled ? classes.add(name) : classes.delete(name),
+          contains: (name) => classes.has(name),
+        },
+        addEventListener: (name, listener) => listeners.set(name, listener),
+        click: () => listeners.get('click')(),
+      });
+    }
+    return elements.get(id);
+  };
+  element('encode-schema').value = 'BCH_5';
+  element('encode-variant').value = 'Q';
+  element('encode-file').files = [{ name: 'cover.png', ...rgbaImage(8, 8) }];
+  Object.assign(tm.context, {
+    document: { getElementById: element, querySelector: element, body: element('body') },
+    location: { search: '' }, URLSearchParams,
+    crypto: { getRandomValues: (bytes) => bytes.fill(1) },
+    URL: { createObjectURL: () => 'blob:watermarked', revokeObjectURL() {} },
+    imageToPngBlob: async () => ({}),
+  });
+  const html = fs.readFileSync(path.join(jsDir, 'index.html'), 'utf8');
+  const script = Array.from(html.matchAll(/<script>([\s\S]*?)<\/script>/g)).at(-1)[1];
+  vm.runInContext(script, tm.context, { filename: 'index.html' });
+
+  assert.equal(element('encode-btn').disabled, false);
+  const embedding = element('encode-btn').click();
+  assert.equal(tm.get('trustmarkStatus')().loaded, false);
+  gate.resolve();
+  const ready = await tm.get('trustmarkReady');
+  await embedding;
+
+  assert.match(element('encode-output').textContent, /^Embedded BCH_5 payload/);
+  assert.equal(tm.get('trustmarkStatus')().models.encoder_Q.status, 'ready');
+  assert.doesNotMatch(element('model-status').textContent, /FAILED/);
+  assert.equal(element('model-status').classList.contains('error'), false);
+  assert.deepEqual(plain(Object.keys(ready.models).sort()), ['decoder_P', 'decoder_Q', 'resizer']);
+});
+
 test('trustmarkEncode embeds the BCH_5 packet and records the encoder backend', async () => {
   const ort = fakeOrt({ failCreate: (name, backend) => (backend === 'webgpu' ? 'no available backend found' : null) });
   const tm = loadWatermark({ ort, fetch: fakeFetch() });
@@ -294,7 +347,8 @@ test('trustmarkEncode embeds the BCH_5 packet and records the encoder backend', 
   assert.equal(result.backend, 'wasm');
   assert.equal(result.image.width, 64);
   assert.equal(result.image.height, 48);
-  assert.equal(Array.from(ort.encoderFeeds[0]['onnx::Gemm_1'].data).join(''), PACKET);
+  assert.equal(ort.encoderFeeds[0].name, 'encoder_Q');
+  assert.equal(Array.from(ort.encoderFeeds[0].feeds['onnx::Gemm_1'].data).join(''), PACKET);
 
   const { models } = tm.get('trustmarkStatus')();
   assert.equal(models.encoder_Q.status, 'ready');
@@ -319,7 +373,97 @@ test('trustmarkEncode fails instead of returning an unwatermarked image', async 
   assert.equal(tm.get('trustmarkStatus')().models.encoder_Q.status, 'error');
 });
 
-test('trustmarkEncode fails when the resizer is missing', async () => {
-  const tm = loadWatermark({ ort: fakeOrt(), fetch: fakeFetch({ missing: ['resizer'] }) });
-  await assert.rejects(tm.get('trustmarkEncode')(rgbaImage(8, 8), PAYLOAD), /resizer model is not loaded: could not download resizer\.onnx/);
+test('trustmarkEncode needs neither the resizer nor a decoder', async () => {
+  const fetchLog = [];
+  const tm = loadWatermark({ ort: fakeOrt(), fetch: fakeFetch({ missing: ['resizer'], log: fetchLog }), autoInit: false });
+  await tm.get('trustmarkInit')({ decoders: [] });
+
+  const result = await tm.get('trustmarkEncode')(rgbaImage(8, 8), PAYLOAD);
+  assert.equal(result.packet, PACKET);
+  assert.deepEqual(fileNames(fetchLog), ['encoder_Q.onnx'], 'only the encoder is downloaded');
+  assert.deepEqual(plain(Object.keys(tm.get('trustmarkStatus')().models)), ['encoder_Q']);
+
+  // Without decoders, runwmark cannot check images
+  const decoded = await tm.get('runwmark')('image.png');
+  assert.equal(decoded.status, 'error');
+  assert.match(decoded.error, /no watermark decoders are loaded/);
+});
+
+test('trustmarkInit loads the chosen decoders and runwmark tries them in that order', async () => {
+  const fetchLog = [];
+  const ort = fakeOrt({ decoderOutputs: { decoder_C: noise, decoder_B: watermarked } });
+  const tm = loadWatermark({ ort, fetch: fakeFetch({ log: fetchLog }), autoInit: false });
+
+  const status = await tm.get('trustmarkInit')({ decoders: ['C', 'B', 'C'] });
+  assert.deepEqual(fileNames(fetchLog), ['resizer.onnx', 'decoder_C.onnx', 'decoder_B.onnx']);
+  assert.deepEqual(plain(Object.keys(status.models)), ['resizer', 'decoder_C', 'decoder_B']);
+
+  const result = await tm.get('runwmark')('image.png');
+  assert.equal(result.status, 'detected');
+  assert.equal(result.variant, 'B');
+  assert.equal(result.watermark, PAYLOAD);
+  assert.equal(result.c2padata['c2pa.soft-binding'].alg, 'com.adobe.trustmark.B');
+  assert.deepEqual(plain(result.decoders.map((d) => [d.variant, d.status])), [['C', 'not_detected'], ['B', 'detected']]);
+});
+
+test('trustmarkInit rejects unknown decoder variants without loading anything', async () => {
+  const fetchLog = [];
+  const tm = loadWatermark({ ort: fakeOrt(), fetch: fakeFetch({ log: fetchLog }), autoInit: false });
+  const init = tm.get('trustmarkInit');
+
+  assert.throws(() => init({ decoders: ['Q', 'X'] }), /Unknown TrustMark variant "X"; expected one of Q, P, B, C/);
+  assert.throws(() => init({ decoders: 'Q' }), /decoders must be an array/);
+  await tick();
+  assert.equal(fetchLog.length, 0);
+
+  // A valid call still works afterwards
+  const status = await init({ decoders: ['P'] });
+  assert.deepEqual(plain(Object.keys(status.models)), ['resizer', 'decoder_P']);
+});
+
+// Packets from the Python data layer (tests/tm_datalayer.test.mjs)
+const SCHEMA_VECTORS = [
+  { variant: 'P', schema: 'BCH_3', payload: '111010100111011000110001010111110101100111100010001100101000001101001110110', packet: '1110101001110110001100010101111101011001111000100011001010000011010011101100001010001101100110000011' },
+  { variant: 'B', schema: 0, payload: '0001000100110011001111111000000010000110', packet: '0001000100110011001111111000000010000110010111010010010001010000110100011100001100011001110111100000' },
+  { variant: 'C', schema: 'BCH_4', payload: '11010110101000001010111100111111101111001100000111111001100001111000', packet: '1101011010100000101011110011111110111100110000011111100110000111100000100101100100101101100100010010' },
+  { variant: 'Q', schema: 'BCH_SUPER', payload: '1', packet: '1000000000000000000000000000000000000000111101101110010000010111110011001101111101111100000110000000' },
+];
+
+test('trustmarkEncode embeds every variant and schema with its own encoder', async () => {
+  const fetchLog = [];
+  const ort = fakeOrt();
+  const tm = loadWatermark({ ort, fetch: fakeFetch({ log: fetchLog }) });
+  const encode = tm.get('trustmarkEncode');
+
+  for (const v of SCHEMA_VECTORS) {
+    const result = await encode(rgbaImage(40, 30), v.payload, { variant: v.variant, schema: v.schema, strength: 0.5 });
+    assert.equal(result.variant, v.variant);
+    assert.equal(result.packet, v.packet);
+    assert.equal(result.schema, typeof v.schema === 'number' ? 'BCH_SUPER' : v.schema);
+    assert.equal(result.payload.length, { BCH_SUPER: 40, BCH_5: 61, BCH_4: 68, BCH_3: 75 }[result.schema]);
+    const feeds = ort.encoderFeeds.at(-1);
+    assert.equal(feeds.name, `encoder_${v.variant}`);
+    assert.equal(Array.from(feeds.feeds['onnx::Gemm_1'].data).join(''), v.packet);
+  }
+  // Each encoder is downloaded once, on first use
+  await encode(rgbaImage(8, 8), '1', { variant: 'P' });
+  assert.deepEqual(fileNames(fetchLog).filter((name) => name.startsWith('encoder_')),
+    ['encoder_P.onnx', 'encoder_B.onnx', 'encoder_C.onnx', 'encoder_Q.onnx']);
+  for (const name of ['encoder_P', 'encoder_B', 'encoder_C', 'encoder_Q']) {
+    assert.equal(tm.get('trustmarkStatus')().models[name].status, 'ready', name);
+  }
+});
+
+test('trustmarkEncode rejects unknown variants, schemas and strengths before downloading', async () => {
+  const fetchLog = [];
+  const tm = loadWatermark({ ort: fakeOrt(), fetch: fakeFetch({ log: fetchLog }) });
+  const encode = tm.get('trustmarkEncode');
+
+  await assert.rejects(encode(rgbaImage(8, 8), '1', { variant: 'Z' }), /Unknown TrustMark variant "Z"; expected one of Q, P, B, C/);
+  await assert.rejects(encode(rgbaImage(8, 8), '1', { schema: 'BCH_6' }), /Unknown watermark schema "BCH_6"/);
+  await assert.rejects(encode(rgbaImage(8, 8), '1', { schema: 7 }), /Unknown watermark schema 7/);
+  await assert.rejects(encode(rgbaImage(8, 8), '1', { strength: -0.5 }), /strength must be a non-negative number/);
+  await assert.rejects(encode(rgbaImage(8, 8), '1'.repeat(41), { variant: 'P', schema: 'BCH_SUPER' }), /41 bits but BCH_SUPER allows at most 40 bits/);
+  await tm.get('trustmarkReady');
+  assert.ok(!fetchLog.some((url) => url.includes('encoder_')), 'no encoder was downloaded');
 });

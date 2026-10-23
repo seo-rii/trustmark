@@ -15,6 +15,11 @@
   <script src="deps/bch_ecc.min.js"></script>
   <script src="tm_datalayer.js"></script>
   <script src="tm_core.js"></script>
+  <script>
+    // The decoders to load can be chosen with a query parameter, e.g. index.html?decoders=Q,P,B,C
+    // (default Q,P; each decoder is a 22-47 MB download)
+    var TRUSTMARK_AUTO_INIT = false;
+  </script>
   <script src="tm_watermark.js"></script>
   <style>
     * {
@@ -150,6 +155,11 @@
       gap: 12px;
       width: 100%;
     }
+    .encode-options {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
     #encode-payload {
       width: 100%;
       font-family: monospace;
@@ -189,12 +199,30 @@
     </div>
   </div>
 
-  <h2>Embed a watermark (variant Q, BCH_5)</h2>
+  <h2>Embed a watermark</h2>
   <div class="upload-container">
     <div class="encode-form">
       <input type="file" id="encode-file" accept="image/*">
-      <label for="encode-payload">Payload (up to 61 bits, shorter payloads are padded with zeros)</label>
-      <input type="text" id="encode-payload" maxlength="61" spellcheck="false">
+      <div class="encode-options">
+        <label>Variant
+          <select id="encode-variant">
+            <option value="Q" selected>Q (balanced)</option>
+            <option value="P">P (highest quality)</option>
+            <option value="B">B (paper model)</option>
+            <option value="C">C (compact)</option>
+          </select>
+        </label>
+        <label>Schema
+          <select id="encode-schema">
+            <option value="BCH_SUPER">BCH_SUPER (40 bits)</option>
+            <option value="BCH_5" selected>BCH_5 (61 bits)</option>
+            <option value="BCH_4">BCH_4 (68 bits)</option>
+            <option value="BCH_3">BCH_3 (75 bits)</option>
+          </select>
+        </label>
+      </div>
+      <label for="encode-payload" id="encode-payload-label">Payload</label>
+      <input type="text" id="encode-payload" spellcheck="false">
       <button class="browse-btn" id="encode-btn">Embed watermark</button>
       <div id="encode-output"></div>
       <a id="encode-download" style="display: none;">Download watermarked PNG</a>
@@ -211,14 +239,26 @@
     const decoderOutput = document.getElementById('decoder-output');
     const modelStatus = document.getElementById('model-status');
 
+    // Load the decoders listed in ?decoders=..., or the default ones
+    const decodersParam = new URLSearchParams(location.search).get('decoders');
+    let initError = '';
+    try {
+      trustmarkInit(decodersParam === null ? {} : { decoders: decodersParam.split(',').map((v) => v.trim().toUpperCase()).filter(Boolean) });
+    } catch (error) {
+      initError = `Error in ?decoders=${decodersParam}: ${error.message}. Loading the default decoders.\n`;
+      modelStatus.textContent = initError;
+      modelStatus.classList.add('error');
+      trustmarkInit();
+    }
+
     // Show which backend each model runs on, and any model that failed to load
     trustmarkReady.then(({ models }) => {
       const lines = Object.entries(models).map(([name, m]) => {
         if (m.status !== 'ready') return `${name}: FAILED - ${m.error}`;
         return `${name}: ${m.backend}` + (m.fallbackFrom ? ` (${m.fallbackFrom} unavailable)` : '');
       });
-      modelStatus.textContent = 'Models: ' + lines.join(', ');
-      modelStatus.classList.toggle('error', Object.values(models).some((m) => m.status !== 'ready'));
+      modelStatus.textContent = initError + 'Models: ' + (lines.join(', ') || 'none (no decoders requested)');
+      modelStatus.classList.toggle('error', initError !== '' || Object.values(models).some((m) => m.status !== 'ready'));
     });
 
     // Logging function
@@ -331,9 +371,19 @@
     const encodeOutput = document.getElementById('encode-output');
     const encodeDownload = document.getElementById('encode-download');
     const encodePreview = document.getElementById('encode-preview');
+    const encodeVariant = document.getElementById('encode-variant');
+    const encodeSchema = document.getElementById('encode-schema');
+    const encodePayloadLabel = document.getElementById('encode-payload-label');
 
-    // Start with a random payload
-    encodePayload.value = Array.from(crypto.getRandomValues(new Uint8Array(61)), (b) => b & 1).join('');
+    // Start with a random payload that fills the schema
+    function randomPayload() {
+      const bits = DataLayer_GetSchemaDataBits(DataLayer_GetSchemaVersion(encodeSchema.value));
+      encodePayload.maxLength = bits;
+      encodePayloadLabel.textContent = `Payload (up to ${bits} bits, shorter payloads are padded with zeros)`;
+      encodePayload.value = Array.from(crypto.getRandomValues(new Uint8Array(bits)), (b) => b & 1).join('');
+    }
+    encodeSchema.addEventListener('change', randomPayload);
+    randomPayload();
 
     encodeBtn.addEventListener('click', async () => {
       const file = encodeFile.files[0];
@@ -347,15 +397,18 @@
       encodePreview.style.display = 'none';
       encodeOutput.textContent = 'Embedding watermark (the encoder model is downloaded on first use)...';
       try {
-        const result = await trustmarkEncode(file, encodePayload.value.trim());
+        const result = await trustmarkEncode(file, encodePayload.value.trim(), { variant: encodeVariant.value, schema: encodeSchema.value });
         const png = await imageToPngBlob(result.image);
         if (encodeDownload.href) URL.revokeObjectURL(encodeDownload.href);
         encodeDownload.href = URL.createObjectURL(png);
-        encodeDownload.download = file.name.replace(/\.[^.]*$/, '') + '_Q.png';
+        encodeDownload.download = file.name.replace(/\.[^.]*$/, '') + `_${result.variant}.png`;
         encodeDownload.style.display = '';
         encodePreview.src = encodeDownload.href;
         encodePreview.style.display = '';
         encodeOutput.textContent = `Embedded ${result.schema} payload ${result.payload} (variant ${result.variant} on ${result.backend}).`;
+        if (!trustmarkStatus().models[TrustmarkCore.getVariant(result.variant).decoder]) {
+          encodeOutput.textContent += `\nThe ${result.variant} decoder is not loaded; open this page with ?decoders=${result.variant} to read the watermark back.`;
+        }
       } catch (error) {
         console.error('Error embedding watermark:', error);
         encodeOutput.classList.add('error');
