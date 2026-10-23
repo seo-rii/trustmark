@@ -7,9 +7,12 @@
  * accordance with the terms of the Adobe license agreement accompanying it.
  */ 
 
+// Number of supported schema versions (BCH_SUPER, BCH_5, BCH_4, BCH_3)
+const DATALAYER_SCHEMA_COUNT = 4;
+
 // Initialize ECC engines for all supported versions
 let eccengine = [];
-for (let version = 0; version < 4; version++) {
+for (let version = 0; version < DATALAYER_SCHEMA_COUNT; version++) {
   eccengine.push(DataLayer_GetECCEngine(version));
 }
 
@@ -20,35 +23,71 @@ for (let version = 0; version < 4; version++) {
  * @param {Array<boolean>} watermarkbool - The boolean array representing the watermark.
  * @param {Array<Object>} eccengine - Array of ECC engines for decoding.
  * @returns {Object} Decoded watermark data with schema and soft binding info.
+ *   softBindingInfo is null when no schema yields a valid watermark.
  */
 function DataLayer_Decode(watermarkbool, eccengine, variant) {
-  let version = DataLayer_GetVersion(watermarkbool);
-  let databits = DataLayer_GetSchemaDataBits(version);
+  const hinted = DataLayer_GetVersion(watermarkbool);
 
-  let data = watermarkbool.slice(0, databits);
-  let ecc = watermarkbool.slice(databits, 96);
-
-  let dataobj = BCH_Decode(eccengine[version], data, ecc);
-  dataobj.schema = DataLayer_GetSchemaName(version);
-
-  if (!dataobj.valid) {
-    // Attempt decoding with alternate schemas
-    for (let alt = 0; alt < 3; alt++) {
-      if (alt === version) continue;
-
-      databits = DataLayer_GetSchemaDataBits(alt);
-      data = watermarkbool.slice(0, databits);
-      ecc = watermarkbool.slice(databits, 96);
-
-      dataobj = BCH_Decode(eccengine[alt], data, ecc);
-      dataobj.schema = DataLayer_GetSchemaName(alt);
-      if (dataobj.valid) break;
-    }
+  // Try the schema signalled by the version bits first. Those bits are not
+  // protected by the ECC, so fall back to every other schema if they are corrupt.
+  const candidates = [hinted];
+  for (let alt = 0; alt < DATALAYER_SCHEMA_COUNT; alt++) {
+    if (alt !== hinted) candidates.push(alt);
   }
 
-  // Add soft binding information
-  dataobj.softBindingInfo = formatSoftBindingData(dataobj.data_binary, version, variant);
-  return dataobj;
+  let primary = null;
+  for (const version of candidates) {
+    const databits = DataLayer_GetSchemaDataBits(version);
+    const data = watermarkbool.slice(0, databits);
+    const ecc = watermarkbool.slice(databits, 96);
+
+    const dataobj = BCH_Decode(eccengine[version], data, ecc);
+    dataobj.schema = DataLayer_GetSchemaName(version);
+    if (dataobj.valid) {
+      // Use the schema that actually recovered the data, not the hinted one
+      dataobj.softBindingInfo = formatSoftBindingData(dataobj.data_binary, version, variant);
+      return dataobj;
+    }
+    if (primary === null) primary = dataobj;
+  }
+
+  // No schema recovered the data, so there is no soft binding to report
+  primary.softBindingInfo = null;
+  return primary;
+}
+
+/**
+ * Builds the 100-bit watermark packet for a binary payload: the data bits, the BCH ECC bits
+ * and 4 version bits ('00' followed by the 2-bit schema). Matches DataLayer.process_encode in
+ * the Python implementation bit for bit.
+ *
+ * @param {string} payload - String of '0' and '1' characters, at most the schema capacity
+ *   (BCH_SUPER 40, BCH_5 61, BCH_4 68, BCH_3 75 bits). Shorter payloads are padded with zeros.
+ * @param {number} version - The schema version (0 BCH_SUPER, 1 BCH_5, 2 BCH_4, 3 BCH_3).
+ * @param {Array<Object>} eccengine - Array of ECC engines indexed by schema version.
+ * @returns {Array<number>} The 100 packet bits as 0/1 numbers.
+ */
+function DataLayer_Encode(payload, version, eccengine) {
+  if (!Number.isInteger(version) || version < 0 || version >= DATALAYER_SCHEMA_COUNT) {
+    throw new Error(`Invalid schema version ${version}`);
+  }
+  if (typeof payload !== 'string' || !/^[01]*$/.test(payload)) {
+    throw new Error("The payload must be a string of '0' and '1' characters");
+  }
+  const databits = DataLayer_GetSchemaDataBits(version);
+  if (payload.length > databits) {
+    throw new Error(`The payload has ${payload.length} bits but ${DataLayer_GetSchemaName(version)} allows at most ${databits} bits`);
+  }
+
+  const data = Array.from(payload.padEnd(databits, '0'), (bit) => bit === '1');
+  const eccbits = 96 - databits;
+  const ecc = [];
+  for (const byte of BCH_Encode(eccengine[version], data)) {
+    for (let shift = 7; shift >= 0; shift--) ecc.push((byte >> shift) & 1);
+  }
+  if (ecc.length < eccbits) throw new Error(`The ECC engine returned ${ecc.length} bits, expected ${eccbits}`);
+
+  return [...data.map(Number), ...ecc.slice(0, eccbits), 0, 0, (version >> 1) & 1, version & 1];
 }
 
 /**
@@ -132,6 +171,21 @@ function DataLayer_GetSchemaDataBits(version) {
       console.error("Invalid schema version");
       return 0;
   }
+}
+
+/**
+ * Returns the schema version for a schema name or version, as numbered by TrustMark.Encoding in
+ * the Python implementation.
+ *
+ * @param {string|number} schema - 'BCH_SUPER', 'BCH_5', 'BCH_4' or 'BCH_3', or 0 to 3.
+ * @returns {number} The schema version (0 BCH_SUPER, 1 BCH_5, 2 BCH_4, 3 BCH_3).
+ * @throws {Error} For an unknown schema.
+ */
+function DataLayer_GetSchemaVersion(schema) {
+  for (let version = 0; version < DATALAYER_SCHEMA_COUNT; version++) {
+    if (schema === version || schema === DataLayer_GetSchemaName(version)) return version;
+  }
+  throw new Error(`Unknown watermark schema ${JSON.stringify(schema)}; expected BCH_SUPER, BCH_5, BCH_4, BCH_3 or 0 to 3`);
 }
 
 /**

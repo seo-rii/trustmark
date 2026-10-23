@@ -1,5 +1,5 @@
 /*!
- * TrustMark JS Watermarking Decoder Module
+ * TrustMark JS Watermarking Module
  * Copyright 2024 Adobe. All rights reserved.
  * Licensed under the MIT License.
  * 
@@ -10,289 +10,420 @@
 // Source for ONNX model binaries
 const MODEL_BASE_URL = "https://cai-watermark.adobe.net/watermarking/trustmark-models/";
 
-// List all watermark models for decoding
-const modelConfigs = [
-  { variantcode: 'Q', fname: 'decoder_Q', sessionVar: 'session_wmarkQ', resolution: 256, squarecrop: false }, 
-  { variantcode: 'P', fname: 'decoder_P', sessionVar: 'session_wmarkP', resolution: 224, squarecrop: true },
-];
+// Variants whose decoders are loaded by default, in the order they are tried. Each decoder
+// is a separate download: decoder_Q, decoder_P and decoder_B are 47 MB each, decoder_C 22 MB.
+// Choose others with trustmarkInit({ decoders }); the per-variant settings (resolution, crop)
+// are TrustmarkCore.VARIANTS.
+const DEFAULT_DECODERS = ['Q', 'P'];
 
+// Variants whose decoders were requested from trustmarkInit()
+let decoderVariants = [];
+
+// Backends tried, in order, for the decoders. If a WebGPU session cannot be created
+// (no adapter, unsupported operator, ...) the decoder falls back to WASM on the CPU.
+const DEFAULT_EXECUTION_PROVIDERS = ['webgpu', 'wasm'];
+
+// Sessions keyed by model name ('decoder_Q', 'encoder_P', ...)
 const sessions = {};
 let session_resize;
 
-// Load model immediately
-(async () => {
-  for (const config of modelConfigs) {
-    let startTime = new Date();
+/**
+ * Load state of every model, keyed by model name ('resizer', 'decoder_Q', ...).
+ * Each entry is { status, backend, fallbackFrom, fallbackReason, error, loadMs } where
+ * status is 'pending', 'loading', 'ready' or 'error', backend is the execution provider the
+ * session runs on, and fallbackFrom/fallbackReason record a backend that failed before it.
+ */
+const modelStates = {};
+
+let trustmarkInitPromise = null;
+let trustmarkOptions = null;
+let trustmarkLoaded = false;
+let resolveTrustmarkReady;
+
+/**
+ * Resolves with trustmarkStatus() once every model has either loaded or failed to load.
+ * It never rejects: check the status of each model, or the `status` field returned by runwmark.
+ */
+const trustmarkReady = new Promise((resolve) => { resolveTrustmarkReady = resolve; });
+
+/**
+ * Starts loading the models and resolves once every model has either loaded or failed.
+ * This runs automatically when the script loads unless `TRUSTMARK_AUTO_INIT = false` is set
+ * before it; set that flag to pass options. Later calls return the same promise.
+ *
+ * @param {Object} [options]
+ * @param {string} [options.modelBaseUrl] - Base URL of the ONNX model files.
+ * @param {Array<string>} [options.executionProviders] - Decoder and encoder backends to try, in order.
+ * @param {Array<string>} [options.decoders=['Q', 'P']] - Variants whose decoders runwmark uses,
+ *   in the order they are tried: any of 'Q', 'P', 'B' and 'C'. An empty list loads no decoder,
+ *   for pages that only embed watermarks.
+ * @returns {Promise<Object>} Resolves with trustmarkStatus().
+ * @throws {Error} If `decoders` names an unknown variant (nothing is loaded then).
+ */
+function trustmarkInit(options = {}) {
+  if (trustmarkInitPromise) {
+    if (Object.keys(options).length) {
+      console.warn('TrustMark models are already loading, so trustmarkInit() options are ignored. ' +
+                   'Set TRUSTMARK_AUTO_INIT = false before loading tm_watermark.js to pass options.');
+    }
+    return trustmarkInitPromise;
+  }
+
+  const decoders = options.decoders === undefined ? DEFAULT_DECODERS : options.decoders;
+  if (!Array.isArray(decoders)) throw new Error('decoders must be an array of variant codes, e.g. [\'Q\', \'P\']');
+  decoders.forEach((code) => TrustmarkCore.getVariant(code));  // throws for an unknown variant
+  decoderVariants = [...new Set(decoders)];
+
+  const baseUrl = options.modelBaseUrl || MODEL_BASE_URL;
+  const executionProviders = options.executionProviders || DEFAULT_EXECUTION_PROVIDERS;
+  trustmarkOptions = { baseUrl, executionProviders };  // also used to load the encoders later
+
+  const decoderNames = decoderVariants.map((code) => TrustmarkCore.getVariant(code).decoder);
+  // Only the decoders use the resizer model
+  const names = decoderNames.length ? ['resizer', ...decoderNames] : [];
+  for (const name of names) modelStates[name] = newModelState('pending');
+
+  trustmarkInitPromise = (async () => {
+    // The resizer must run on WASM: WebGPU's Resize does not support antialiasing
+    if (decoderNames.length) session_resize = await loadModelSession('resizer', baseUrl, ['wasm']);
+    for (const name of decoderNames) {
+      const session = await loadModelSession(name, baseUrl, executionProviders);
+      if (session) sessions[name] = session;
+    }
+    trustmarkLoaded = true;
+    const status = trustmarkStatus();
+    resolveTrustmarkReady(status);
+    return status;
+  })();
+  return trustmarkInitPromise;
+}
+
+/**
+ * Returns a snapshot of the model load state.
+ * @returns {{loaded: boolean, models: Object}} `loaded` is true once trustmarkInit() has
+ *   finished (each model is then 'ready' or 'error'); `models` maps names to modelStates entries.
+ */
+function trustmarkStatus() {
+  const models = {};
+  for (const [name, state] of Object.entries(modelStates)) {
+    models[name] = Object.assign({}, state);
+  }
+  return { loaded: trustmarkLoaded, models };
+}
+
+/**
+ * Creates a model state entry.
+ * @param {string} status - The initial status.
+ * @returns {Object} The state.
+ */
+function newModelState(status) {
+  return { status, backend: null, fallbackFrom: null, fallbackReason: null, error: null, loadMs: null };
+}
+
+/**
+ * Downloads an ONNX model once and creates a session on the first backend that works.
+ * The outcome is recorded in modelStates[name]; failures are recorded rather than thrown.
+ *
+ * @param {string} name - Model name; the file is `${baseUrl}${name}.onnx`.
+ * @param {string} baseUrl - Base URL of the model files.
+ * @param {Array<string>} executionProviders - Backends to try, in order.
+ * @returns {Promise<ort.InferenceSession|null>} The session, or null if none could be created.
+ */
+async function loadModelSession(name, baseUrl, executionProviders) {
+  const state = newModelState('loading');
+  modelStates[name] = state;
+  const startTime = Date.now();
+
+  let model;
+  try {
+    const response = await fetch(`${baseUrl}${name}.onnx`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    model = new Uint8Array(await response.arrayBuffer());
+  } catch (error) {
+    state.status = 'error';
+    state.error = `could not download ${name}.onnx: ${errorMessage(error)}`;
+    console.error(`Could not load ${name} model:`, state.error);
+    return null;
+  }
+
+  const failures = [];
+  for (const backend of executionProviders) {
     try {
-      sessions[config.sessionVar] = await ort.InferenceSession.create(`${MODEL_BASE_URL}${config.fname}.onnx`, { executionProviders: ['webgpu'] });
-      let timeElapsed = new Date() - startTime;
-      console.log(`${config.fname} model loaded in ${timeElapsed / 1000} seconds`);
+      const session = await ort.InferenceSession.create(model, { executionProviders: [backend] });
+      state.status = 'ready';
+      state.backend = backend;
+      state.loadMs = Date.now() - startTime;
+      if (failures.length) {
+        state.fallbackFrom = failures[0].backend;
+        state.fallbackReason = failures.map((f) => `${f.backend}: ${f.message}`).join('; ');
+        console.warn(`${name} model fell back to ${backend} (${state.fallbackReason})`);
+      }
+      console.log(`${name} model loaded on ${backend} in ${state.loadMs / 1000} seconds`);
+      return session;
     } catch (error) {
-      console.error(`Could not load ${config.fname} watermark decoder model`, error);
+      failures.push({ backend, message: errorMessage(error) });
     }
   }
-  let startTime = new Date();
-  try {
-       session_resize = await ort.InferenceSession.create(`${MODEL_BASE_URL}resizer.onnx`, { executionProviders: ['wasm'] });  // cannot use GPU for this due to lack of antialias
-       let timeElapsed = new Date() - startTime;
-       console.log(`Image downscaler model loaded in ${timeElapsed / 1000} seconds`);
-  }
-  catch (error) {
-     console.log('Could not load image downscaler model', error);
-     console.log(error)
-  }
-})();
 
+  state.status = 'error';
+  state.error = failures.length
+    ? `could not create a ${name} session: ` + failures.map((f) => `${f.backend}: ${f.message}`).join('; ')
+    : `no execution provider configured for ${name}`;
+  console.error(`Could not load ${name} model:`, state.error);
+  return null;
+}
 
-/* WebGPU will fail silently and intermittently if multiple concurrent inference calls are made
-   this routine ensures sequential calling from multiple threads.  Note this simple JS demo is single threaded. */
-let inferenceLock = false;
+/**
+ * Returns a readable message for any thrown value.
+ * @param {*} error - The thrown value.
+ * @returns {string} The message.
+ */
+function errorMessage(error) {
+  return (error && error.message) ? error.message : String(error);
+}
 
-async function safeRunInference(session, feed) {
-  while (inferenceLock) {
-    // Wait for any ongoing inference
-    await new Promise(resolve => setTimeout(resolve, 30));
-  }
+/* WebGPU will fail silently and intermittently if multiple concurrent inference calls are made.
+   Every inference therefore goes through this FIFO promise chain, so only one session.run()
+   is in flight at a time and calls run in the order they were made. */
+let inferenceQueue = Promise.resolve();
       
-  inferenceLock = true; // Lock inference
-  try {
-    return await session.run(feed); // Run the inference
-  } catch (error) {
-    console.error("Inference error:", error); // Log any error
-    throw error; // Rethrow for further debugging
-  } finally {
-    inferenceLock = false; // Unlock after inference
-  }
+/**
+ * Runs a session after every previously queued inference has finished.
+ * @param {ort.InferenceSession} session - The session to run.
+ * @param {Object} feed - The input feeds.
+ * @returns {Promise<Object>} The session outputs; rejects if this inference fails.
+ */
+function safeRunInference(session, feed) {
+  const result = inferenceQueue.then(() => session.run(feed));
+  // A failed inference must not stall the queue; the caller still receives the rejection
+  inferenceQueue = result.then(() => undefined, () => undefined);
+  return result;
 }
      
 
 /**
- * Converts an image URL to a tensor suitable for processing.
- * @param {string} imageUrl - The URL of the image to load.
- * @returns {Promise<ort.Tensor>} The processed tensor.
+ * Reads an image into RGBA pixels with a canvas.
+ * @param {string|Blob|ImageData} source - Image URL (e.g. a data URL), File/Blob, or an
+ *   ImageData-like { data, width, height } object, which is returned as is.
+ * @returns {Promise<ImageData>} The pixels.
  */
-async function loadImageAsTensor(imageUrl) {
-  const img = new Image();
-  img.src = imageUrl;
+async function loadImageData(source) {
+  if (source && source.data && source.width && source.height) return source;
 
+  const url = typeof source === 'string' ? source : URL.createObjectURL(source);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Failed to load image"));
+      img.src = url;
+    });
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    ctx.drawImage(img, 0, 0);
+    return ctx.getImageData(0, 0, img.width, img.height);
+  } finally {
+    if (url !== source) URL.revokeObjectURL(url);
+  }
+}
+
+/**
+ * Returns the runtime that TrustmarkCore functions run models with.
+ * @returns {Object} { ort, resizer, run }
+ */
+function coreRuntime() {
+  return { ort, resizer: session_resize, run: safeRunInference };
+}
+
+/**
+ * Returns the error for a model that is not available.
+ * @param {string} name - Model name.
+ * @returns {Error} The error, including why the model failed to load.
+ */
+function modelNotLoadedError(name) {
+  const state = modelStates[name];
+  return new Error(`${name} model is not loaded${state && state.error ? `: ${state.error}` : ''}`);
+}
+
+
+/**
+ * Decodes the watermark from an image. Waits for the models to finish loading first,
+ * starting the load if trustmarkInit() has not been called yet.
+ *
+ * @param {string} base64Image - The image URL, typically a data URL.
+ * @returns {Promise<object>} The decoding result:
+ *   - status: 'detected', 'not_detected', or 'error'. 'error' means at least one decoder could
+ *     not check the image (model not loaded, inference failed, unreadable image) and none found
+ *     a watermark, so the absence of a watermark could not be established.
+ *   - watermark_present: true only when status is 'detected'.
+ *   - watermark, schema, c2padata: payload bits, schema name and C2PA soft binding, or null.
+ *   - variant, backend: variant code and execution backend of the detecting decoder, or null.
+ *   - error: description of the failures when status is 'error', otherwise null.
+ *   - decoders: per decoder { variant, status, backend, error }.
+ */
+async function runwmark(base64Image) {
+  await trustmarkInit();
+
+  const decoders = [];
+  let found = null;
+
+  if (!decoderVariants.length) {
+    return watermarkResult('error', null, decoders, 'no watermark decoders are loaded; pass trustmarkInit({ decoders })');
+  }
+
+  let image;
+  try {
+    image = await loadImageData(base64Image);
+  } catch (error) {
+    console.error("Error in watermark decoding:", error);
+    return watermarkResult('error', null, decoders, `could not read the image: ${errorMessage(error)}`);
+  }
+
+  for (const variant of decoderVariants) {
+    const name = TrustmarkCore.getVariant(variant).decoder;
+    const outcome = { variant, status: 'error', backend: null, error: null };
+    decoders.push(outcome);
+
+    const session = sessions[name];
+    if (!session) {
+      outcome.error = modelNotLoadedError(name).message;
+      continue;
+    }
+    outcome.backend = modelStates[name].backend;
+
+    try {
+      if (!session_resize) throw modelNotLoadedError('resizer');
+
+      let startTime = new Date();
+      const watermarkBool = await TrustmarkCore.decodeBits(coreRuntime(), session, image, variant);
+
+      const dataObj = DataLayer_Decode(watermarkBool, eccengine, variant);
+      console.log(`Watermark model inference in ${(new Date() - startTime)} milliseconds`);
+
+      outcome.status = dataObj.valid ? 'detected' : 'not_detected';
+      // Report the first detected watermark (if many were)
+      if (dataObj.valid && !found) found = { dataObj, outcome };
+    } catch (error) {
+      console.error(`Error in ${name} watermark decoding:`, error);
+      outcome.error = `${name}: ${errorMessage(error)}`;
+    }
+  }
+
+  if (found) return watermarkResult('detected', found, decoders, null);
+
+  const failed = decoders.filter((d) => d.status === 'error');
+  if (failed.length) return watermarkResult('error', null, decoders, failed.map((d) => d.error).join('; '));
+
+  return watermarkResult('not_detected', null, decoders, null);
+}
+
+/**
+ * Builds the object returned by runwmark.
+ * @param {string} status - 'detected', 'not_detected' or 'error'.
+ * @param {?Object} found - { dataObj, outcome } of the detecting decoder, or null.
+ * @param {Array<Object>} decoders - Per-decoder outcomes.
+ * @param {?string} error - Failure description when status is 'error'.
+ * @returns {Object} The result.
+ */
+function watermarkResult(status, found, decoders, error) {
+  return {
+    status,
+    watermark_present: status === 'detected',
+    watermark: found ? found.dataObj.data_binary : null,
+    schema: found ? found.dataObj.schema : null,
+    c2padata: found ? found.dataObj.softBindingInfo : null,
+    variant: found ? found.outcome.variant : null,
+    backend: found ? found.outcome.backend : null,
+    error,
+    decoders,
+  };
+}
+
+// Watermark embedding. Each encoder model (17 MB) is only downloaded when the first image is
+// watermarked with its variant.
+const encoderLoads = {};
+
+/**
+ * Loads the encoder model of a variant once, after the models of trustmarkInit().
+ * @param {string} variant - Variant code.
+ * @returns {Promise<ort.InferenceSession|null>} The session, or null if it failed to load.
+ */
+function loadEncoder(variant) {
+  const name = TrustmarkCore.getVariant(variant).encoder;
+  if (!encoderLoads[name]) {
+    // Register the encoder when its download starts, after the initial readiness snapshot.
+    encoderLoads[name] = trustmarkInit().then(async () => {
+      const session = await loadModelSession(name, trustmarkOptions.baseUrl, trustmarkOptions.executionProviders);
+      if (session) sessions[name] = session;
+      return session;
+    });
+  }
+  return encoderLoads[name];
+}
+
+/**
+ * Embeds a TrustMark watermark into an image, like TrustMark.encode in the Python implementation
+ * (MODE='binary'). The alpha channel is kept. Rejects, rather than returning an unwatermarked
+ * image, if an option or the payload is invalid, the image cannot be read or the model is
+ * unavailable; invalid options and payloads are rejected before anything is downloaded.
+ *
+ * @param {string|Blob|ImageData} image - Image URL, File/Blob, or RGBA ImageData.
+ * @param {string} payload - '0'/'1' characters, at most the capacity of the schema (BCH_SUPER 40,
+ *   BCH_5 61, BCH_4 68, BCH_3 75 bits); shorter payloads are padded with zeros.
+ * @param {Object} [options]
+ * @param {string} [options.variant='Q'] - Model variant: 'Q', 'P', 'B' or 'C'.
+ * @param {string|number} [options.schema='BCH_5'] - Error correction schema: 'BCH_SUPER', 'BCH_5',
+ *   'BCH_4' or 'BCH_3', or its number (0 to 3, as TrustMark.Encoding in Python).
+ * @param {number} [options.strength=1.0] - Watermark strength (variant P multiplies it by 1.25).
+ * @returns {Promise<Object>} { image: { data, width, height } (RGBA), payload (the embedded data
+ *   bits), packet (the 100 bits fed to the encoder), schema (its name), variant, backend }.
+ */
+async function trustmarkEncode(image, payload, options = {}) {
+  // Validate everything before downloading anything
+  const { variant, strength } = TrustmarkCore.resolveEncodeOptions(options);
+  const schema = DataLayer_GetSchemaVersion(options.schema === undefined ? 'BCH_5' : options.schema);
+  const packet = DataLayer_Encode(payload, schema, eccengine);
+  const name = variant.encoder;
+
+  const encoder = await loadEncoder(variant.code);
+  if (!encoder) throw modelNotLoadedError(name);
+
+  const pixels = await loadImageData(image);
+  const startTime = Date.now();
+  const watermarked = await TrustmarkCore.encodeWatermark(coreRuntime(), encoder, pixels, packet, { variant: variant.code, strength });
+  console.log(`Watermark embedded in ${Date.now() - startTime} milliseconds`);
+
+  return {
+    image: watermarked,
+    payload: payload.padEnd(DataLayer_GetSchemaDataBits(schema), '0'),
+    packet: packet.join(''),
+    schema: DataLayer_GetSchemaName(schema),
+    variant: variant.code,
+    backend: modelStates[name].backend,
+  };
+}
+
+/**
+ * Encodes RGBA pixels as a PNG file.
+ * The canvas stores premultiplied alpha, so the colour of semi-transparent pixels can
+ * change slightly, and fully transparent pixels lose their colour.
+ *
+ * @param {{data: Uint8ClampedArray, width: number, height: number}} image - The pixels.
+ * @returns {Promise<Blob>} The PNG.
+ */
+function imageToPngBlob(image) {
+  const canvas = document.createElement('canvas');
+  canvas.width = image.width;
+  canvas.height = image.height;
+  canvas.getContext('2d').putImageData(new ImageData(image.data, image.width, image.height), 0, 0);
   return new Promise((resolve, reject) => {
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
-      const imgData = ctx.getImageData(0, 0, img.width, img.height);
-
-      const { data, width, height } = imgData;
-      const totalPixels = width * height;
-      const imageTensor = new Float32Array(totalPixels * 3);
-
-      let j = 0;
-      const page = width * height;
-      const twopage = 2 * page;
-
-      for (let i = 0; i < totalPixels; i++) {
-        const index = i * 4;
-        imageTensor[j] = data[index] / 255.0; // Red channel
-        imageTensor[j + page] = data[index + 1] / 255.0; // Green channel
-        imageTensor[j + twopage] = data[index + 2] / 255.0; // Blue channel
-        j++;
-      }
-
-      resolve(new ort.Tensor('float32', imageTensor, [1, 3, height, width]));
-    };
-
-    img.onerror = () => reject("Failed to load image");
+    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('Could not encode the PNG'))), 'image/png');
   });
 }
 
-/**
- * Computes scale factors for image resizing with precision.
- * @param {Array<number>} targetDims - Target dimensions for the image.
- * @param {Array<number>} inputDims - Input tensor dimensions.
- * @returns {Float32Array} Scale factors as a tensor.
- */
-function computeScalesFixed(targetDims, inputDims) {
-  const [batch, channels, height, width] = inputDims;
-  const [targetHeight, targetWidth] = targetDims;
-
-  function computeScale(originalSize, targetSize) {
-    let minScale = targetSize / originalSize;
-    let maxScale = (targetSize + 1) / originalSize;
-    let scale;
-    let adjustedSize;
-
-    const tolerance = 1e-12;
-    let iterations = 0;
-    const maxIterations = 100;
-
-    while (iterations < maxIterations) {
-      scale = (minScale + maxScale) / 2;
-      adjustedSize = Math.floor(originalSize * scale + tolerance);
-
-      if (adjustedSize < targetSize) {
-        minScale = scale;
-      } else if (adjustedSize > targetSize) {
-        maxScale = scale;
-      } else {
-        break; // Found the correct scale
-      }
-
-      iterations++;
-    }
-
-    return scale;
-  }
-
-  const scaleH = computeScale(height, targetHeight);
-  const scaleW = computeScale(width, targetWidth);
-
-  return new Float32Array([1.0, 1.0, scaleH, scaleW]);
+// Load the models immediately unless the page opted out to call trustmarkInit(options) itself
+if (typeof TRUSTMARK_AUTO_INIT === 'undefined' || TRUSTMARK_AUTO_INIT !== false) {
+  trustmarkInit();
 }
-
-/**
- * Resizes the image tensor to a square size suitable for watermark decoding.
- * @param {ort.Tensor} inputTensor - The input image tensor.
- * @param {number} targetSize - The target size for resizing.
- * @returns {Promise<ort.Tensor>} The resized tensor.
- */
-async function runResizeModelSquare(inputTensor, targetSize, force_square) {
-    try {
-        const inputDims = inputTensor.dims;  // Get dimensions of the input tensor
-        const [batch, channels, height, width] = inputDims;
-        
-        // Compute the aspect ratio
-        const aspectRatio = width / height;
-        const lscape= (aspectRatio>=1.0);
-                
-        let croppedTensor = inputTensor;
-        let cropWidth = width;
-        let cropHeight = height;
-        
-        // If the aspect ratio is greater than 2.0, we need to crop the center square
-        if (lscape && (aspectRatio > 2.0 || force_square)) {
-            cropWidth = height;  // Take a square from the width
-            const offsetX = Math.floor((width - cropWidth) / 2);  // Horizontal center crop
-            croppedTensor = await cropTensor(inputTensor, offsetX, 0, cropWidth, height);
-        }
-        
-        if (!lscape && (aspectRatio < 0.5 || force_square)) {
-            cropHeight = width;  // Take a square from the height
-            const offsetY = Math.floor((height - cropHeight) / 2);  // Vertical center crop
-            croppedTensor = await cropTensor(inputTensor, 0, offsetY, width, cropHeight);
-        }
-    
-        // After cropping, resize the tensor to the target size
-        const targetDims = [targetSize, targetSize];
-        const scales = computeScalesFixed(targetDims, [batch, channels, cropHeight, cropWidth]);
-        const scalesTensor = new ort.Tensor('float32', scales, [4]);
-                
-        // Prepare the target size tensor
-        const targetSizeTensor = new ort.Tensor('int64', new BigInt64Array([BigInt(targetSize)]), [1]);
-            
-        // Set up the feeds for the model
-        const feeds = {
-            'X': croppedTensor,       // Cropped image tensor
-            'scales': scalesTensor,   // Scales tensor
-            'target_size': targetSizeTensor  // Dynamic target size tensor
-        };
-
-        const results = await session_resize.run(feeds);
-        return results['Y'];
-            
-    } catch (error) {
-        console.error('Error during resizing:', error);
-        return null; 
-    }
-}
-
-// Helper function to crop the tensor
-async function cropTensor(inputTensor, offsetX, offsetY, cropWidth, cropHeight) {
-    const [batch, channels, height, width] = inputTensor.dims;  
-    const croppedData = new Float32Array(batch * channels * cropWidth * cropHeight);
-    const inputData = inputTensor.data;
-         
-    let k = 0;
-    for (let c = 0; c < channels; c++) {
-        for (let y = 0; y < cropHeight; y++) {
-            for (let x = 0; x < cropWidth; x++) {
-                const srcIndex = c * width * height + (y + offsetY) * width + (x + offsetX);
-                croppedData[k++] = inputData[srcIndex];
-            }
-        }
-    }
-        
-    return new ort.Tensor('float32', croppedData, [batch, channels, cropHeight, cropWidth]);
-}                  
-
-
-/**
- * Decodes the watermark from the processed image tensor.
- * @param {string} base64Image - Base64 representation of the image.
- * @returns {Promise<object>} Decoded watermark data.
- */
-async function runwmark(base64Image) {
-
-  let watermarks=[]
-  let watermarks_present=[];
-  try {
-
-    const inputTensor = await loadImageAsTensor(base64Image);
-
-    for (const config of modelConfigs) {
-
-        const session = sessions[config.sessionVar];
-        if (!session) {
-          console.error(`Session for ${config.fname} not loaded, skipping.`);
-          continue;
-        }
-
-
-        const resizedTensorWM = await runResizeModelSquare(inputTensor, config.resolution, config.squarecrop);
-        if (!resizedTensorWM) throw new Error("Failed to resize tensor for watermark detection.");
-
-        const feeds = { image: resizedTensorWM };
-
-        let startTime = new Date();
-        const results = await safeRunInference(session, feeds);
-
-        const watermarkFloat = results['output']['cpuData'];
-        const watermarkBool = watermarkFloat.map((v) => v >= 0);
-
-        const dataObj = DataLayer_Decode(watermarkBool, eccengine, config.variantcode);
-        console.log(`Watermark model inference in ${(new Date() - startTime)} milliseconds`);
-
-        // Append results to arrays
-        watermarks.push(dataObj);
-        watermarks_present.push(dataObj.valid);
-    }
-
-   } catch (error) {
-     console.error("Error in watermark decoding:", error);
-     return { watermark_present: false, watermark: null, schema: null };
-   }
-
-   // Get first detected watermark (if many were)
-   const firstValidIndex = watermarks_present.findIndex(isValid => isValid === true);
-   let watermark;
-   let watermark_present=false;
-   if (firstValidIndex !== -1) {
-      watermark = watermarks[firstValidIndex];
-
-      return {
-         watermark_present: watermark.valid,
-         watermark: watermark.valid ? watermark.data_binary : null,
-         schema: watermark.schema,
-         c2padata: watermark.softBindingInfo,
-      };
-   }
-   else {
-      return {
-         watermark_present: false,
-      }
-   }
-
-
-}
-
