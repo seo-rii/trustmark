@@ -416,7 +416,7 @@ const encoderLoads = {};
 function loadEncoder(variant) {
   const name = TrustmarkCore.getVariant(variant).encoder;
   if (!encoderLoads[name]) {
-    modelStates[name] = newModelState('pending');
+    // Register the encoder when its download starts, after the initial readiness snapshot.
     encoderLoads[name] = trustmarkInit().then(async () => {
       // A WebGPU encoder that silently returns zeros would destroy the image, so check it first
       const session = await loadModelSession(name, trustmarkOptions.baseUrl, trustmarkOptions.executionProviders, 'webgpu');
