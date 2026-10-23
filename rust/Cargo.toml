@@ -26,6 +26,11 @@ harness = false
 name = "encode"
 harness = false
 
+[features]
+# Run the models on NVIDIA GPUs with ONNX Runtime's CUDA execution provider; see
+# `ExecutionProvider::Cuda`. Makes `ort` download an ONNX Runtime build with CUDA support.
+cuda = ["ort/cuda"]
+
 [dependencies]
 image = "0.25.6"
 fast_image_resize = { version = "5.1.4", features = ["image", "rayon"] }
