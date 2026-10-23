@@ -29,7 +29,8 @@ def split_alpha(image):
         raise ValueError('image has no pixels (size %dx%d)' % image.size)
     if mode == 'RGB':
         return image, None
-    if mode == 'P' and 'transparency' in image.info:
+    if mode == 'P' and ('transparency' in image.info or
+                        (image.palette is not None and image.palette.mode == 'RGBA')):
         image = image.convert('RGBA')  # palette transparency becomes an alpha band
         mode = 'RGBA'
     alpha = image.getchannel('A') if mode in ('RGBA', 'LA') else None

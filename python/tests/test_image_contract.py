@@ -139,6 +139,25 @@ def test_output_mode_and_alpha(name, method):
         assert out.getchannel('A').tobytes() == alpha.tobytes()
 
 
+@pytest.mark.parametrize('method', ['encode', 'remove_watermark'])
+def test_rgba_palette_alpha_is_preserved(method):
+    rgba = Image.new('RGBA', (48, 36), (255, 0, 0, 0))
+    rgba.paste((0, 255, 0, 128), (24, 0, 48, 36))
+    image = rgba.convert('P')
+    # Pillow stores this transparency in the palette, without an info entry.
+    assert image.palette.mode == 'RGBA'
+    assert 'transparency' not in image.info
+    expected = image.convert('RGBA')
+
+    out = call(stub_trustmark(), method, image)
+
+    assert out.mode == 'RGBA'
+    assert out.size == image.size
+    assert out.getchannel('A').tobytes() == expected.getchannel('A').tobytes()
+    rgb_out = call(stub_trustmark(), method, expected.convert('RGB'))
+    assert out.convert('RGB').tobytes() == rgb_out.tobytes()
+
+
 def test_rgb_input_is_used_without_conversion(monkeypatch):
     image = rgba_noise().convert('RGB')
 
