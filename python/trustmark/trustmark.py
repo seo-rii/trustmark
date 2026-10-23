@@ -12,9 +12,12 @@ import os
 import pathlib
 import time
 import importlib
+import math
+import numbers
 
 from omegaconf import OmegaConf
 from .datalayer import DataLayer
+from .image_io import split_alpha
 from PIL import Image
 from torchvision import transforms
 import numpy as np
@@ -110,6 +113,8 @@ class TrustMark():
         self.ecc = DataLayer(secret_len, verbose=verbose, encoding_mode=encoding_type)
         self.enctyp = encoding_type
         self.aspect_ratio_lim=ASPECT_RATIO_LIM
+        if not _is_finite_number(concentrate_wm_region) or not 0 < concentrate_wm_region <= 1:
+            raise ValueError('concentrate_wm_region must be a finite number in (0, 1], got %r' % (concentrate_wm_region,))
         self.concentrate_wm_region=concentrate_wm_region
 
         if model_type=='P':
@@ -238,6 +243,8 @@ class TrustMark():
             
             out_im = out_im.crop((left, top, right, bottom))
 
+        if out_im.width < 1 or out_im.height < 1:
+            raise ValueError('a %dx%d image is too small for concentrate_wm_region=%g' % (width, height, scale))
         return out_im
 
 
@@ -353,6 +360,7 @@ class TrustMark():
             raise RuntimeError("BBox detector model is not loaded. "
                                "Initialize TrustMark passing construtor loadBBoxDetector=True.")
 
+        in_stego_image, _ = split_alpha(in_stego_image)
         max_edge = self.model_resolution_max_detect
         w, h = in_stego_image.size
         if max(w, h) > max_edge:
@@ -400,7 +408,7 @@ class TrustMark():
     @torch.no_grad()
     def decode(self, in_stego_image, MODE='text', DETECTFIRST=False, ROTATION=False):
         # Inputs
-        # stego_image: PIL image
+        # stego_image: PIL image, any mode accepted by encode (analysed as RGB)
         # Outputs: secret numpy array (1, secret_len)
 
         if ROTATION:
@@ -408,6 +416,7 @@ class TrustMark():
         else:
            angleset = [0]
 
+        in_stego_image, _ = split_alpha(in_stego_image)
         for angle in angleset:
             if angle == 0:
                 rotated_cover = in_stego_image #rgbcover.rotate(angle) 
@@ -464,10 +473,15 @@ class TrustMark():
     @torch.no_grad()
     def encode(self, in_cover_image, string_secret, MODE='text', WM_STRENGTH=1.0, WM_MERGE='bilinear'):
         # Inputs
-        #   cover_image: PIL image
+        #   cover_image: 8-bit PIL image in mode RGB, RGBA, LA, L, P or CMYK
         #   secret_tensor: (1, secret_len)
-        # Outputs: stego image (PIL image)
-        
+        # Outputs: stego image (PIL image), RGBA with the input's alpha band unchanged when the
+        #   input has transparency (RGBA, LA, P with transparency), else RGB
+
+        rgb_cover_image, alpha = split_alpha(in_cover_image)
+        if not _is_finite_number(WM_STRENGTH) or WM_STRENGTH < 0:
+            raise ValueError('WM_STRENGTH must be a finite number >= 0, got %r' % (WM_STRENGTH,))
+
         # secrets
         if not self.use_ECC:
             if MODE=="binary":
@@ -478,6 +492,8 @@ class TrustMark():
                 secret = ''.join(format(x, '08b') for x in secret)
                 secret = [int(x) for x in secret]
                 secret = np.array(secret, dtype=np.float32)
+            if len(secret) != self.secret_len:
+                raise ValueError('without ECC the payload must be exactly %d bits, got %d bits' % (self.secret_len, len(secret)))
         else:
             if MODE=="binary":
                 secret = self.ecc.encode_binary([string_secret])
@@ -487,7 +503,7 @@ class TrustMark():
             WM_STRENGTH = WM_STRENGTH * 1.25
         secret = torch.from_numpy(secret).float().to(self.device)
         
-        cover_image = self.get_the_image_for_processing(in_cover_image)
+        cover_image = self.get_the_image_for_processing(rgb_cover_image)
         w, h = cover_image.size
         cover = cover_image.resize((self.model_resolution_enc,self.model_resolution_enc), Image.BILINEAR)
         tic=time.time()
@@ -502,9 +518,12 @@ class TrustMark():
             residual = torch.nn.functional.interpolate(residual, size=(h, w), mode=WM_MERGE)
             residual = residual.permute(0,2,3,1).cpu().numpy().astype('f4')  # (1,modelres,modelres,3)
             stego = np.clip(residual[0]*WM_STRENGTH + np.array(cover_image)/127.5-1., -1, 1)*127.5+127.5  # (modelres, modelres, 3), ndarray, uint8
-            stego = self.put_the_image_after_processing(stego, np.asarray(in_cover_image).astype(np.uint8))
+            stego = self.put_the_image_after_processing(stego, np.asarray(rgb_cover_image).astype(np.uint8))
 
-        return Image.fromarray(stego.astype(np.uint8))
+        stego = Image.fromarray(stego.astype(np.uint8))
+        if alpha is not None:
+            stego.putalpha(alpha)
+        return stego
 
     @torch.no_grad()
     def remove_watermark(self, in_cover_image, WM_STRENGTH=1.0, WM_MERGE='bilinear'):
@@ -513,7 +532,11 @@ class TrustMark():
             raise ModelNotLoadedError("Watermark remover model is not loaded. "
                                       "Initialize TrustMark passing the constructor loadRemover=True before calling remove_watermark().")
 
-        stego = self.get_the_image_for_processing(in_cover_image)
+        rgb_cover_image, alpha = split_alpha(in_cover_image)
+        if not _is_finite_number(WM_STRENGTH) or WM_STRENGTH < 0:
+            raise ValueError('WM_STRENGTH must be a finite number >= 0, got %r' % (WM_STRENGTH,))
+
+        stego = self.get_the_image_for_processing(rgb_cover_image)
         W, H = stego.size
         if self.model_type == 'P':
             WM_STRENGTH = WM_STRENGTH * 1.25
@@ -523,8 +546,11 @@ class TrustMark():
         res = img256 - stego256
         res = torch.nn.functional.interpolate(res, (H,W), mode=WM_MERGE).permute(0,2,3,1).cpu().numpy()   # (B,3,H,W) no need antialias since this op is mostly upsampling
         out = np.clip(res[0]*WM_STRENGTH + np.asarray(stego)/127.5-1., -1, 1)*127.5+127.5  # (modelres, modelres, 3), ndarray, uint8
-        stego = self.put_the_image_after_processing(out, np.asarray(in_cover_image).astype(np.uint8))
-        return Image.fromarray(stego.astype(np.uint8))
+        stego = self.put_the_image_after_processing(out, np.asarray(rgb_cover_image).astype(np.uint8))
+        stego = Image.fromarray(stego.astype(np.uint8))
+        if alpha is not None:
+            stego.putalpha(alpha)
+        return stego
 
 
 
@@ -548,3 +574,5 @@ def instantiate_from_config(config):
   
 
 
+def _is_finite_number(value):
+    return isinstance(value, numbers.Real) and math.isfinite(value)
