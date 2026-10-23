@@ -36,7 +36,7 @@ fn cpu_selection_and_fallback_ignore_environment_providers() {
             ..SessionOptions::default()
         };
         let tm = Trustmark::with_options("./models", Variant::Q, Version::Bch5, options).unwrap();
-        for info in [tm.encoder_provider(), tm.decoder_provider()] {
+        for info in [tm.encoder_provider(), tm.decoder_provider()].map(Option::unwrap) {
             assert_eq!(info.requested, requested);
             assert_eq!(info.registered, ExecutionProvider::Cpu);
             assert_eq!(

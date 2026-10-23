@@ -205,8 +205,8 @@ mod tests {
     fn default_options_use_the_cpu() {
         let tm = Trustmark::new("./models", Variant::Q, Version::Bch5).unwrap();
         let cpu = ProviderInfo::new(ExecutionProvider::Cpu);
-        assert_eq!(tm.encoder_provider(), &cpu);
-        assert_eq!(tm.decoder_provider(), &cpu);
+        assert_eq!(tm.encoder_provider(), Some(&cpu));
+        assert_eq!(tm.decoder_provider(), Some(&cpu));
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -243,7 +243,7 @@ mod tests {
             cuda(ProviderFallback::Cpu),
         )
         .unwrap();
-        for info in [tm.encoder_provider(), tm.decoder_provider()] {
+        for info in [tm.encoder_provider(), tm.decoder_provider()].map(Option::unwrap) {
             assert_eq!(info.requested, ExecutionProvider::Cuda { device_id: 0 });
             assert_eq!(info.registered, ExecutionProvider::Cpu);
             assert!(info
@@ -266,7 +266,7 @@ mod tests {
             cuda(ProviderFallback::Cpu),
         )
         .unwrap();
-        for info in [tm.encoder_provider(), tm.decoder_provider()] {
+        for info in [tm.encoder_provider(), tm.decoder_provider()].map(Option::unwrap) {
             assert_eq!(info.requested, ExecutionProvider::Cuda { device_id: 0 });
             match info.registered {
                 ExecutionProvider::Cuda { device_id: 0 } => assert_eq!(info.fallback_reason, None),
@@ -290,8 +290,8 @@ mod tests {
         )
         .unwrap();
         let cuda = ProviderInfo::new(ExecutionProvider::Cuda { device_id: 0 });
-        assert_eq!(tm.encoder_provider(), &cuda);
-        assert_eq!(tm.decoder_provider(), &cuda);
+        assert_eq!(tm.encoder_provider(), Some(&cuda));
+        assert_eq!(tm.decoder_provider(), Some(&cuda));
         roundtrip(&tm);
     }
 

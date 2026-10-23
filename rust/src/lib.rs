@@ -57,11 +57,15 @@ mod model;
 mod session;
 
 /// A loaded Trustmark model.
+///
+/// [`Trustmark::new`] and [`Trustmark::with_options`] load both the encoder and the decoder.
+/// [`Trustmark::encoder_only`] and [`Trustmark::decoder_only`] load one of them, for a process
+/// that only embeds or only reads watermarks.
 pub struct Trustmark {
-    encoder: Mutex<Session>,
-    decoder: Mutex<Session>,
-    encoder_provider: ProviderInfo,
-    decoder_provider: ProviderInfo,
+    encoder: Option<Mutex<Session>>,
+    decoder: Option<Mutex<Session>>,
+    encoder_provider: Option<ProviderInfo>,
+    decoder_provider: Option<ProviderInfo>,
     version: Version,
     variant: Variant,
 }
@@ -87,6 +91,12 @@ pub enum Error {
         provider: ExecutionProvider,
         source: ort::Error,
     },
+    /// [`Trustmark::encode`] was called on a model loaded with [`Trustmark::decoder_only`].
+    #[error("the encoder was not loaded")]
+    EncoderNotLoaded,
+    /// [`Trustmark::decode`] was called on a model loaded with [`Trustmark::encoder_only`].
+    #[error("the decoder was not loaded")]
+    DecoderNotLoaded,
 }
 
 impl From<bits::Error> for Error {
@@ -119,7 +129,7 @@ pub use session::{ExecutionProvider, ProviderFallback, ProviderInfo};
 ///     ..SessionOptions::default()
 /// };
 /// let tm = Trustmark::with_options("./models", Variant::Q, Version::Bch5, options).unwrap();
-/// if let Some(reason) = &tm.decoder_provider().fallback_reason {
+/// if let Some(reason) = &tm.decoder_provider().unwrap().fallback_reason {
 ///     eprintln!("decoding on the CPU: {reason}");
 /// }
 /// ```
@@ -168,13 +178,62 @@ impl Trustmark {
         version: Version,
         options: SessionOptions,
     ) -> Result<Self, Error> {
-        let (encoder, encoder_provider) =
-            session::load(&models.as_ref().join(variant.encoder_filename()), &options)?;
-        let (decoder, decoder_provider) =
-            session::load(&models.as_ref().join(variant.decoder_filename()), &options)?;
+        Self::load(models.as_ref(), variant, version, options, true, true)
+    }
+
+    /// Load only the encoder of a Trustmark model.
+    ///
+    /// Only the encoder file is read, and only its session is created. [`Trustmark::decode`]
+    /// returns [`Error::DecoderNotLoaded`].
+    pub fn encoder_only<P: AsRef<Path>>(
+        models: P,
+        variant: Variant,
+        version: Version,
+        options: SessionOptions,
+    ) -> Result<Self, Error> {
+        Self::load(models.as_ref(), variant, version, options, true, false)
+    }
+
+    /// Load only the decoder of a Trustmark model.
+    ///
+    /// Only the decoder file is read, and only its session is created. [`Trustmark::encode`]
+    /// returns [`Error::EncoderNotLoaded`]. Decoding does not depend on a [`Version`]: the decoder
+    /// reads it from the watermark.
+    pub fn decoder_only<P: AsRef<Path>>(
+        models: P,
+        variant: Variant,
+        options: SessionOptions,
+    ) -> Result<Self, Error> {
+        Self::load(
+            models.as_ref(),
+            variant,
+            Version::default(),
+            options,
+            false,
+            true,
+        )
+    }
+
+    fn load(
+        models: &Path,
+        variant: Variant,
+        version: Version,
+        options: SessionOptions,
+        encoder: bool,
+        decoder: bool,
+    ) -> Result<Self, Error> {
+        let load = |file: String| session::load(&models.join(file), &options);
+        let (encoder, encoder_provider) = encoder
+            .then(|| load(variant.encoder_filename()))
+            .transpose()?
+            .unzip();
+        let (decoder, decoder_provider) = decoder
+            .then(|| load(variant.decoder_filename()))
+            .transpose()?
+            .unzip();
         Ok(Self {
-            encoder: Mutex::new(encoder),
-            decoder: Mutex::new(decoder),
+            encoder: encoder.map(Mutex::new),
+            decoder: decoder.map(Mutex::new),
             encoder_provider,
             decoder_provider,
             version,
@@ -182,14 +241,16 @@ impl Trustmark {
         })
     }
 
-    /// The execution provider requested for the encoder session and the one it was created with.
-    pub fn encoder_provider(&self) -> &ProviderInfo {
-        &self.encoder_provider
+    /// The execution provider requested for the encoder session and the one it was created with,
+    /// or `None` if the encoder was not loaded.
+    pub fn encoder_provider(&self) -> Option<&ProviderInfo> {
+        self.encoder_provider.as_ref()
     }
 
-    /// The execution provider requested for the decoder session and the one it was created with.
-    pub fn decoder_provider(&self) -> &ProviderInfo {
-        &self.decoder_provider
+    /// The execution provider requested for the decoder session and the one it was created with,
+    /// or `None` if the decoder was not loaded.
+    pub fn decoder_provider(&self) -> Option<&ProviderInfo> {
+        self.decoder_provider.as_ref()
     }
 
     /// Encode a watermark into an image.
@@ -211,13 +272,12 @@ impl Trustmark {
 
         let input_img: Value<TensorValueType<f32>> =
             ModelImage(encode_size, self.variant, img.clone()).try_into()?;
+        // before the payload is checked against `self.version`, which decoder-only models lack
+        let encoder = self.encoder.as_ref().ok_or(Error::EncoderNotLoaded)?;
         let bits: Value<TensorValueType<f32>> =
             Bits::apply_error_correction_and_schema(watermark, self.version)?.into();
         let output_img = {
-            let mut encoder = self
-                .encoder
-                .lock()
-                .map_err(|_| Error::SessionLockPoisoned)?;
+            let mut encoder = encoder.lock().map_err(|_| Error::SessionLockPoisoned)?;
             let outputs = encoder.run(ort::inputs![
                 "onnx::Concat_0" => input_img,
                 "onnx::Gemm_1" => bits,
@@ -258,6 +318,8 @@ impl Trustmark {
         let watermark = {
             let mut decoder = self
                 .decoder
+                .as_ref()
+                .ok_or(Error::DecoderNotLoaded)?
                 .lock()
                 .map_err(|_| Error::SessionLockPoisoned)?;
             let outputs = decoder.run(ort::inputs![
@@ -277,6 +339,66 @@ mod tests {
     #[test]
     fn loading_models() {
         Trustmark::new("./models", Variant::Q, Version::Bch5).unwrap();
+    }
+
+    /// A models directory that holds only `file` from `./models`.
+    fn models_with_only(file: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("trustmark-{}-{file}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = std::fs::canonicalize(Path::new("./models").join(file)).unwrap();
+        if std::fs::hard_link(&model, dir.join(file)).is_err() {
+            std::fs::copy(&model, dir.join(file)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn encoder_only_loads_just_the_encoder() {
+        let models = models_with_only(&Variant::Q.encoder_filename());
+        let tm = Trustmark::encoder_only(
+            &models,
+            Variant::Q,
+            Version::Bch5,
+            SessionOptions::default(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(models).unwrap();
+        assert!(tm.encoder_provider().is_some());
+        assert_eq!(tm.decoder_provider(), None);
+
+        let input = image::open("../images/ghost.png").unwrap();
+        let watermark = "1011011110011000111111000000011111011111011100000110110110111".to_owned();
+        let encoded = DynamicImage::ImageRgba8(
+            tm.encode(watermark.clone(), input, 0.95)
+                .unwrap()
+                .to_rgba8(),
+        );
+        let err = tm.decode(encoded.clone()).unwrap_err();
+        assert!(matches!(err, Error::DecoderNotLoaded), "{err:?}");
+
+        let full = Trustmark::new("./models", Variant::Q, Version::Bch5).unwrap();
+        assert_eq!(full.decode(encoded).unwrap(), watermark);
+    }
+
+    #[test]
+    fn decoder_only_loads_just_the_decoder() {
+        let full = Trustmark::new("./models", Variant::Q, Version::Bch5).unwrap();
+        let input = image::open("../images/ghost.png").unwrap();
+        let watermark = "1011011110011000111111000000011111011111011100000110110110111".to_owned();
+        let encoded = full.encode(watermark.clone(), input.clone(), 0.95).unwrap();
+
+        let models = models_with_only(&Variant::Q.decoder_filename());
+        let tm = Trustmark::decoder_only(&models, Variant::Q, SessionOptions::default()).unwrap();
+        std::fs::remove_dir_all(models).unwrap();
+        assert_eq!(tm.encoder_provider(), None);
+        assert!(tm.decoder_provider().is_some());
+
+        let decoded = tm
+            .decode(DynamicImage::ImageRgba8(encoded.to_rgba8()))
+            .unwrap();
+        assert_eq!(decoded, watermark);
+        let err = tm.encode(watermark, input, 0.95).unwrap_err();
+        assert!(matches!(err, Error::EncoderNotLoaded), "{err:?}");
     }
 
     #[test]
