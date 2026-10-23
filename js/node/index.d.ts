@@ -218,10 +218,67 @@ export type TrustmarkErrorCode =
   | 'MODEL_LOAD_FAILED'
   | 'INFERENCE_FAILED'
   | 'QUEUE_FULL'
-  | 'CLOSED';
+  | 'CLOSED'
+  | 'VERIFICATION_FAILED';
 
 export class TrustmarkError extends Error {
   constructor(code: TrustmarkErrorCode, message: string, options?: { cause?: unknown; details?: unknown });
   readonly code: TrustmarkErrorCode;
   readonly details?: unknown;
+}
+
+/** Anything that can read a watermark, e.g. a second instance on another execution provider. */
+export interface WatermarkVerifier {
+  readonly variant?: Variant;
+  decode(input: ImageInput, options?: DecodeOptions): Promise<DecodeResult>;
+}
+
+export interface VerifiedEncodeOptions extends Omit<EncodeOptions, 'strength'> {
+  /** Strength of the first attempt (default 1.0). */
+  strength?: number;
+  /** Higher strengths to try, in order, when the watermark is not read back (default none). */
+  retryStrengths?: readonly number[];
+  /** Decoder used for the check (default: the same instance). */
+  verifier?: WatermarkVerifier;
+}
+
+export type VerificationFailureReason = 'not_detected' | 'payload_mismatch' | 'schema_mismatch' | 'decode_error' | 'bytes_changed';
+
+export interface VerificationAttempt {
+  strength: number;
+  status: DecodeResult['status'];
+  payload: Bitstring | null;
+  schema: Schema | null;
+  bitFlips: number | null;
+  error: { code: TrustmarkErrorCode | null; message: string } | null;
+  /** Why this attempt failed, or null for the attempt that passed. */
+  reason: VerificationFailureReason | null;
+}
+
+export interface VerifiedEncodeResult extends EncodeResult {
+  /** SHA-256 (hex) of `bytes`, the exact bytes that were decoded. */
+  sha256: string;
+  verification: {
+    payload: Bitstring;
+    schema: Schema;
+    bitFlips: number | null;
+    backend: string | null;
+    attempts: VerificationAttempt[];
+  };
+}
+
+/**
+ * Embeds the payload, encodes the final format and quality, decodes those exact bytes again and
+ * returns them only if the payload and schema read back exactly. Otherwise it rejects with a
+ * WatermarkVerificationError (after the optional retries); it never returns the input or bytes
+ * that failed verification. Encode errors and aborts reject as they do for encode().
+ */
+export function encodeVerified(trustmark: Trustmark, input: ImageInput, payload: Bitstring, options?: VerifiedEncodeOptions): Promise<VerifiedEncodeResult>;
+
+export class WatermarkVerificationError extends TrustmarkError {
+  constructor(message: string, options: { reason: VerificationFailureReason; attempts: VerificationAttempt[]; cause?: unknown });
+  readonly code: 'VERIFICATION_FAILED';
+  /** Why the last attempt failed. */
+  readonly reason: VerificationFailureReason;
+  readonly attempts: VerificationAttempt[];
 }
