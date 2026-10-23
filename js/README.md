@@ -30,7 +30,7 @@ This example consists of a simple HTML file, `index.html` that loads three JavaS
 - [`tm_datalayer.js`](https://github.com/adobe/trustmark/blob/main/js/tm_datalayer.js) handles data decoding and schema-specific processing.  It also implements error correction and interpretation of binary watermark data.
 - [`tm_core.js`](https://github.com/adobe/trustmark/blob/main/js/tm_core.js) holds the per-variant settings (`VARIANTS`), the image processing shared by the watermark models (centre-square cropping and antialiased resizing) and the watermark embedding math. It has no DOM dependency: ONNX Runtime and the sessions are passed in, and images are `{ data, width, height }` RGBA objects. It defines the global `TrustmarkCore` when loaded as a classic script, and is a CommonJS module in Node.js (`require('./tm_core.js')`).
 
-If GPU compute is available (if you're using Google Chrome, check `chrome://gpu`), then the code will automatically use WebGPU to process the ONNX models.  If you use WebGPU it will only run in a secure context, which means on localhost or an HTTPS link.  You can start a local HTTPS server by running the `server.py` script and a suitable OpenSSL certificate in `server.pem`.  If a WebGPU session cannot be created for a model, that model falls back to WebAssembly (WASM) on the CPU, and the fallback is recorded in its load state.
+If GPU compute is available (if you're using Google Chrome, check `chrome://gpu`), then the code will automatically use WebGPU to process the ONNX models.  If you use WebGPU it will only run in a secure context, which means on localhost or an HTTPS link.  You can start a local HTTPS server by running `python3 server.py --https` with a suitable OpenSSL certificate and key in `server.pem`.  If a WebGPU session cannot be created for a model, or its first inference fails, that model falls back to WebAssembly (WASM) on the CPU, and the fallback is recorded in its load state. The watermark models compute in float16, so WebGPU needs an adapter with the `shader-f16` feature. Without it, ONNX Runtime Web 1.20 cannot compile its shaders but still returns outputs, all zeros, instead of an error, which would make decoders miss watermarks and encoders destroy the image. Every WebGPU session is therefore first run on a blank image, and WebGPU errors or all-zero outputs during that run count as a failure, so the model falls back to WASM.
 
 ## Key parameters
 
@@ -49,8 +49,8 @@ The demo page takes the list from its URL, for example `index.html?decoders=Q,P,
 `tm_watermark.js` starts downloading the models as soon as it loads. The loading lifecycle is exposed through these globals:
 
 - `trustmarkReady`: a promise that resolves once every model has either loaded or failed to load. It never rejects; it resolves with the same value as `trustmarkStatus()`.
-- `trustmarkStatus()`: returns `{ loaded, models }`. `loaded` is `true` once loading has finished. `models` maps each model name (`resizer`, `decoder_Q`, `decoder_P`, and `encoder_Q` and so on once an encoder is loaded) to `{ status, backend, fallbackFrom, fallbackReason, error, loadMs }`, where `status` is `pending`, `loading`, `ready` or `error`, and `backend` is the execution provider the session runs on (`webgpu` or `wasm`). When WebGPU fails and the model falls back to WASM, `fallbackFrom` is `webgpu` and `fallbackReason` holds the WebGPU error.
-- `trustmarkInit(options)`: starts loading (once) and returns a promise for the status. To pass options, set `TRUSTMARK_AUTO_INIT = false` before loading `tm_watermark.js`, then call it yourself. The options are `modelBaseUrl` (where the `.onnx` files are fetched from), `executionProviders` (the decoder and encoder backends to try in order, by default `['webgpu', 'wasm']`) and `decoders` (the variants to decode, by default `['Q', 'P']`; an unknown variant throws an error and loads nothing). The resizer always runs on WASM, because WebGPU does not support antialiased resizing.
+- `trustmarkStatus()`: returns `{ loaded, models }`. `loaded` is `true` once loading has finished. `models` maps each model name (`resizer`, `decoder_Q`, `decoder_P`, and `encoder_Q` and so on once an encoder is loaded) to `{ status, backend, fallbackFrom, fallbackReason, error, loadMs, warmUpMs }`, where `status` is `pending`, `loading`, `ready` or `error`, and `backend` is the execution provider the session runs on (`webgpu` or `wasm`). When WebGPU fails and the model falls back to WASM, `fallbackFrom` is `webgpu` and `fallbackReason` holds the WebGPU error. `warmUpMs` is the duration of the first inference run while loading, or `null`.
+- `trustmarkInit(options)`: starts loading (once) and returns a promise for the status. To pass options, set `TRUSTMARK_AUTO_INIT = false` before loading `tm_watermark.js`, then call it yourself. The options are `modelBaseUrl` (where the `.onnx` files are fetched from), `executionProviders` (the decoder and encoder backends to try in order, by default `['webgpu', 'wasm']`), `decoders` (the variants to decode, by default `['Q', 'P']`; an unknown variant throws an error and loads nothing) and `warmUp` (by default `true`: run the resizer and each decoder once on a blank image while loading, see [Performance](#performance)). The resizer always runs on WASM, because WebGPU does not support antialiased resizing.
 
   ```html
   <script>var TRUSTMARK_AUTO_INIT = false;</script>
@@ -119,15 +119,24 @@ Limitations:
 - Like the Python implementation, small regions and payloads that are mostly zeros can be hard to decode, especially with variant P and the `BCH_4` and `BCH_3` schemas, which correct fewer errors.
 - In the browser, images go through a canvas: colour profiles are applied when the image is read, the canvas stores premultiplied alpha (so fully transparent pixels lose their colour, and semi-transparent pixels can shift slightly), and the downloaded PNG is RGBA without the original metadata. `tm_core.js` itself works on the exact RGBA values it is given.
 
+## Performance
+
+- **Serve the page cross-origin isolated.** ONNX Runtime Web only uses several CPU threads for WASM in a cross-origin isolated page, that is, one served with the `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` headers. `server.py` sends them; `python -m http.server` does not. In Chromium on an 8-core machine this makes each model inference 2.1 to 2.3 times faster (encoder about 430 ms instead of 1000 ms, decoder about 200 ms instead of 415 ms). The model CDN allows cross-origin requests, so the models still load.
+- **The first inference is slow, so it happens while loading.** The first inference of a page starts the WASM threads or compiles the WebGPU shaders. `trustmarkInit` runs the resizer and each decoder once on a blank image (`warmUp`, on by default), which makes loading slower and the first `runwmark` call faster: in Chromium on WASM, loading Q and P took about 1.2 s longer and the first `runwmark` on a 512x512 image took 560 ms instead of 935 ms (the next ones take about 500 ms). Encoders are loaded on first use, so they are only run beforehand on WebGPU, to check that they work.
+- **Embedding works on the 256x256 residual.** The residual is upscaled to the image size while it is added, instead of in a separate full-size copy (110 MB of floats for a 9-megapixel image). For a 4032x2268 image, the residual paste takes 215 ms instead of 445 ms, and the 256x256 downscale 72 ms instead of 82 ms (Node.js 24, median of 9). The output is unchanged, byte for byte.
+- Encoding the result as PNG in the browser (`imageToPngBlob`) takes about 270 ms for a 4032x2268 image in Chromium.
+- WebGPU timings have not been measured with these models. The adapters tested, SwiftShader and an NVIDIA A100 through Vulkan in headless Chromium 149 on Linux, do not offer `shader-f16`, so the models fall back to WASM there.
+
 ## Run the example
 
 To run the example:
 
-1. Start a local web server; for example, using Python: 
+1. Start a local web server from the `js` directory, for example with the provided script, which makes the page cross-origin isolated so that WASM can use several threads (see [Performance](#performance)):
     ```
-    python -m http.server 8000
+    python3 server.py 8000
     ```
-1. Open `index.html` in a browser to run the example.
+    Any static web server works, for example `python -m http.server 8000`, but then WASM runs on a single thread.
+1. Open `http://localhost:8000/index.html` in a browser to run the example.
 1. Drag and drop images (for example from the provided [`images`](https://github.com/adobe/trustmark/tree/main/images) directory) onto the indicated area in the web page, which will display information if the image contains a TrustMark watermark (see example below).
 
 To use the code in your own project, include the JavaScript files in the same order as `index.html` (`deps/ort.webgpu.min.js`, `deps/bch_ecc.min.js`, `tm_datalayer.js`, `tm_core.js`, `tm_watermark.js`).
